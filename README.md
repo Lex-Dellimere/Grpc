@@ -13,15 +13,13 @@ gRPC clients and servers for Mettle, in pure Mettle.
   retries and hedging with retry throttling and server pushback (gRFC A6)
 - Keepalive pings and server enforcement, connection idle and age limits (gRFC A8, A9)
 - Health (`grpc.health.v1`) and reflection (`grpc.reflection.v1`, `v1alpha`) services
+- TLS and mutual TLS (h2 over ALPN) through mtls
 
 Follows the [gRPC over HTTP/2 protocol](https://github.com/grpc/grpc/blob/master/doc/PROTOCOL-HTTP2.md).
 HTTP/2 itself comes from the standard library's `std/http2`.
 
-## Status
-
-Everything above HTTP/2 is done and tested over an in-memory transport.
-Running over the network waits for the `std/http2` connection layer;
-TLS will come through [mtls](https://github.com/Lex-Dellimere/mtls).
+Transports: HTTP/2 over TCP (std/h2conn), TLS and mutual TLS through
+[mtls](https://github.com/Lex-Dellimere/mtls), and an in-memory pair.
 
 ## Use
 
@@ -31,6 +29,8 @@ fn deps() {
   mb_dep_path("grpc", "../grpc");
   mb_dep_path("codec", "../codec");
   mb_dep_path("press", "../press");
+  mb_dep_path("mtls", "../mtls");        // for grpc/tls
+  mb_dep_path("crypto", "../cryptex");
 }
 ```
 

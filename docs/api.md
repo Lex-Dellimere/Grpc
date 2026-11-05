@@ -192,6 +192,38 @@ Answers list_services, file_by_filename and file_containing_symbol on
 
 A call runs on a `GrpcTransport` (src/transport.mettle): a table of
 functions over one HTTP/2 connection, seen as streams and events.
-`grpc_mem_pipe_init` / `grpc_mem_transport` give a connected client and
-server pair in memory. The HTTP/2 transport over TCP and mtls comes with
-the `std/http2` connection layer.
+
+| | |
+|---|---|
+| `grpc_h2_dial(&t, host, port, timeout_ms)` | client over TCP (h2c, prior knowledge) |
+| `grpc_h2_init(&t, net_stream, is_server, cfg)` | any connected `NetStream`, such as an accepted socket (`net_stream_socket(fd)`) |
+| `grpc_h2_transport(&t)` | the table for `grpc_channel_init` / `grpc_server_conn_init` |
+| `grpc_h2_free(&t)` | close and free |
+| `grpc_mem_pipe_init`, `grpc_mem_transport` | a client and server pair in memory |
+
+HTTP/2 is std/h2conn. One `GrpcH2` is one connection; a server accepts
+sockets and runs one `GrpcServerConn` per connection (one thread each, or
+its own loop with `grpc_server_conn_step`).
+
+## TLS
+
+`import "grpc/tls"` (it brings in mtls and cryptex):
+
+```mettle
+var roots: MtlsRoots;
+mtls_roots_init(&roots);
+mtls_roots_load_system(&roots);             // or mtls_roots_add_file(&roots, "ca.pem")
+var cfg: MtlsConfig;
+mtls_config_init(&cfg);
+cfg.roots = &roots;
+var s: MtlsStream;
+var t: GrpcH2;
+grpc_tls_dial(&t, &s, "example.com", 443, &cfg, 5000);   // GRPC_TLS_OK
+copts.scheme = "https";
+```
+
+A server calls `grpc_tls_accept(&t, &s, fd, &cfg)` on each accepted
+socket, with `mtls_config_load_cert_files(&cfg, chain, key)`. For mutual
+TLS set `cfg.roots` and `cfg.client_auth = MTLS_CLIENT_AUTH_REQUIRE` on
+the server and load a client certificate on the client. ALPN `h2` is
+added to the config and required of the peer.
