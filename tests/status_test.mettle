@@ -1,0 +1,39 @@
+// Status codes, names and grpc-message percent-encoding.
+import "grpc/status";
+import "tutil";
+import "std/arena";
+
+fn main() -> int32 {
+  t_str("name 14", grpc_code_name(14), "UNAVAILABLE");
+  t_str("name bad", grpc_code_name(99), "UNKNOWN");
+  t_eq("parse lower", grpc_code_parse("unavailable"), 14);
+  t_eq("parse upper", grpc_code_parse("DEADLINE_EXCEEDED"), 4);
+  t_eq("parse bad", grpc_code_parse("NOPE"), -1);
+  t_eq("wire 0", grpc_code_from_wire("0"), 0);
+  t_eq("wire 16", grpc_code_from_wire("16"), 16);
+  t_eq("wire 17", grpc_code_from_wire("17"), GRPC_UNKNOWN);
+  t_eq("wire x", grpc_code_from_wire("1x"), GRPC_UNKNOWN);
+  t_eq("wire empty", grpc_code_from_wire(""), GRPC_UNKNOWN);
+  t_eq("http 404", grpc_code_from_http(404), GRPC_UNIMPLEMENTED);
+  t_eq("http 503", grpc_code_from_http(503), GRPC_UNAVAILABLE);
+  t_eq("http 200", grpc_code_from_http(200), GRPC_UNKNOWN);
+
+  var a: Arena* = arena_init(0);
+  t_str("enc plain", grpc_message_encode_in(a, "hello world"), "hello world");
+  t_str("enc pct", grpc_message_encode_in(a, "50%"), "50%25");
+  var nl: string = "a\nb";
+  t_str("enc nl", grpc_message_encode_in(a, nl), "a%0Ab");
+  t_str("dec", grpc_message_decode_in(a, "a%0Ab%25"), nl + "%");
+  t_str("dec lower hex", grpc_message_decode_in(a, "%c3%a9"), grpc_message_decode_in(a, "%C3%A9"));
+  t_str("dec bad kept", grpc_message_decode_in(a, "%zz%4"), "%zz%4");
+  t_str("dec tail", grpc_message_decode_in(a, "ab%"), "ab%");
+  // Round trip over every byte value.
+  var all: uint8[256];
+  for i in 0..256 { all[i] = (uint8)i; }
+  var s: string;
+  s.chars = &all[0];
+  s.length = 256;
+  t_ok("round trip", grpc_message_decode_in(a, grpc_message_encode_in(a, s)) == s);
+  arena_free(a);
+  return t_done("status");
+}

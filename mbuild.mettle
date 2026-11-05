@@ -1,6 +1,6 @@
 // mbuild.mettle: the project file for grpc. `mbuild help` lists its commands.
 //
-// Layout: src/grpc.mettle is the facade; modules sit in src/grpc/.
+// Layout: src/grpc.mettle is the facade ("grpc/grpc"); modules sit in src/.
 // Tests: tests/<name>_test.mettle, run with `mbuild test` and `mbuild test -r`.
 import "mbuild/api";
 
@@ -13,9 +13,6 @@ fn project() {
 }
 
 fn deps() {
-  // Added as each part lands (see PLAN.md):
-  // mb_dep_path("http", "../http");
-  // mb_dep_path("codec", "../codec");
-  // mb_dep_path("press", "../press");
-  // mb_dep_path("mtls", "../mtls");
+  mb_dep_path("press", "../press");
+  mb_dep_path("codec", "../codec");
 }

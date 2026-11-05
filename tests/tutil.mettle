@@ -1,0 +1,48 @@
+// Shared helpers for the test programs.
+import "std/io";
+
+var g_checks: int32 = 0;
+var g_fails: int32 = 0;
+
+export fn t_ok(name: string, cond: bool) {
+  g_checks = g_checks + 1;
+  if (!cond) {
+    g_fails = g_fails + 1;
+    println("FAIL {name}");
+  }
+}
+
+export fn t_eq(name: string, got: int64, want: int64) {
+  g_checks = g_checks + 1;
+  if (got != want) {
+    g_fails = g_fails + 1;
+    println("FAIL {name}: got {got}, want {want}");
+  }
+}
+
+export fn t_str(name: string, got: string, want: string) {
+  g_checks = g_checks + 1;
+  if (got != want) {
+    g_fails = g_fails + 1;
+    println("FAIL {name}: got '{got}', want '{want}'");
+  }
+}
+
+// A repeatable PRNG (xorshift64*) for fuzz loops.
+var g_rng: uint64 = 88172645463325252;
+export fn t_seed(s: uint64) { g_rng = s; if (g_rng == 0) { g_rng = 1; } }
+export fn t_rand() -> uint64 {
+  g_rng = g_rng ^ (g_rng >> 12);
+  g_rng = g_rng ^ (g_rng << 25);
+  g_rng = g_rng ^ (g_rng >> 27);
+  return g_rng * 2685821657736338717;
+}
+
+export fn t_done(what: string) -> int32 {
+  if (g_fails > 0) {
+    println("{what}: {g_fails} of {g_checks} checks failed");
+    return 1;
+  }
+  println("{what}: {g_checks} checks passed");
+  return 0;
+}

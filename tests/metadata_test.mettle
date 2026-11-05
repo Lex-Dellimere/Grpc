@@ -1,0 +1,123 @@
+// Metadata keys and values, base64, and the deadline helpers.
+import "grpc/metadata";
+import "grpc/deadline";
+import "grpc/status";
+import "tutil";
+import "std/arena";
+
+fn b64(a: Arena*, s: string) -> string {
+  var p: uint8* = (uint8*)arena_alloc(a, grpc_b64_len((int64)s.length) + 1);
+  var r: string;
+  r.chars = p;
+  r.length = (uint64)grpc_b64_encode(s.chars, (int64)s.length, p);
+  return r;
+}
+
+fn unb64(a: Arena*, s: string) -> string {
+  var p: uint8* = (uint8*)arena_alloc(a, (int64)s.length + 3);
+  var r: string;
+  var n: int64 = grpc_b64_decode(s.chars, (int64)s.length, p);
+  if (n < 0) { return "ERR"; }
+  r.chars = p;
+  r.length = (uint64)n;
+  return r;
+}
+
+fn timeout(ns: int64) -> string {
+  var buf: uint8[16];
+  var r: string;
+  r.chars = &buf[0];
+  r.length = (uint64)grpc_timeout_encode(ns, &buf[0]);
+  return r + "";
+}
+
+fn main() -> int32 {
+  var a: Arena* = arena_init(0);
+  // RFC 4648 test vectors, unpadded.
+  t_str("b64 f", b64(a, "f"), "Zg");
+  t_str("b64 fo", b64(a, "fo"), "Zm8");
+  t_str("b64 foo", b64(a, "foo"), "Zm9v");
+  t_str("b64 foobar", b64(a, "foobar"), "Zm9vYmFy");
+  t_str("unb64 padded", unb64(a, "Zm9vYg=="), "foob");
+  t_str("unb64 unpadded", unb64(a, "Zm9vYg"), "foob");
+  t_str("unb64 bad", unb64(a, "Zm9v!"), "ERR");
+  t_str("unb64 bad len", unb64(a, "Z"), "ERR");
+  t_str("unb64 bad pad", unb64(a, "Zg="), "ERR");
+
+  var md: GrpcMetadata;
+  grpc_md_init(&md, a);
+  t_eq("add", grpc_md_add(&md, "X-User", "alice"), GRPC_MD_OK);
+  t_eq("add repeat", grpc_md_add(&md, "x-user", "bob"), GRPC_MD_OK);
+  t_eq("reserved", grpc_md_add(&md, "grpc-status", "0"), GRPC_MD_E_RESERVED);
+  t_eq("reserved te", grpc_md_add(&md, "TE", "x"), GRPC_MD_E_RESERVED);
+  t_eq("bad key", grpc_md_add(&md, "a b", "x"), GRPC_MD_E_KEY);
+  t_eq("bad value", grpc_md_add(&md, "k", "line\n"), GRPC_MD_E_VALUE);
+  var raw: string = "\0\n\t";
+  t_eq("bin any bytes", grpc_md_add(&md, "trace-bin", raw), GRPC_MD_OK);
+  var v: string;
+  t_ok("get", grpc_md_get(&md, "x-user", &v) && v == "alice");
+  t_ok("nth", grpc_md_get_nth(&md, "X-USER", 1, &v) && v == "bob");
+  t_eq("count", grpc_md_count(&md, "x-user"), 2);
+  t_ok("key lowered", md.items[0].key == "x-user");
+
+  var hl: GrpcHeaderList;
+  grpc_hl_init(&hl, a);
+  grpc_md_to_headers(&md, &hl);
+  t_eq("headers", hl.count, 3);
+  t_str("bin on wire", hl.items[2].value, "AAoJ");
+
+  var back: GrpcMetadata;
+  grpc_md_init(&back, a);
+  for i in 0..hl.count { grpc_md_add_wire(&back, hl.items[i].name, hl.items[i].value); }
+  t_ok("bin back", grpc_md_get(&back, "trace-bin", &v) && v == raw);
+  t_eq("wire skips reserved", grpc_md_add_wire(&back, "grpc-status", "0"), GRPC_MD_OK);
+  t_eq("wire joined bin", grpc_md_add_wire(&back, "k-bin", "Zg==, Zm8"), GRPC_MD_OK);
+  t_eq("joined count", grpc_md_count(&back, "k-bin"), 2);
+  t_ok("joined second", grpc_md_get_nth(&back, "k-bin", 1, &v) && v == "fo");
+  t_eq("wire bad b64", grpc_md_add_wire(&back, "k-bin", "@@"), GRPC_MD_E_BASE64);
+  t_eq("remove", grpc_md_remove(&back, "x-user"), 2);
+  t_eq("set", grpc_md_set(&back, "k-bin", "z"), GRPC_MD_OK);
+  t_eq("set count", grpc_md_count(&back, "k-bin"), 1);
+
+  // grpc-timeout.
+  t_str("t 0", timeout(0), "0n");
+  t_str("t 1s", timeout(1000000000), "1000000u");
+  t_str("t 99ms", timeout(99999999), "99999999n");
+  t_str("t round up", timeout(100000001), "100001u");
+  t_str("t hours", timeout(9223372036854775807), "2562048H");
+  t_eq("d 1S", grpc_timeout_decode("1S"), 1000000000);
+  t_eq("d 5m", grpc_timeout_decode("5m"), 5000000);
+  t_eq("d 2M", grpc_timeout_decode("2M"), 120000000000);
+  t_eq("d 1H", grpc_timeout_decode("1H"), 3600000000000);
+  t_eq("d 7n", grpc_timeout_decode("7n"), 7);
+  t_eq("d too long", grpc_timeout_decode("123456789S"), -1);
+  t_eq("d no unit", grpc_timeout_decode("10"), -1);
+  t_eq("d bad unit", grpc_timeout_decode("10x"), -1);
+  t_eq("d empty", grpc_timeout_decode(""), -1);
+  t_eq("d saturate", grpc_timeout_decode("99999999H"), 9223372036854775807);
+  // Round trip: decode(encode(x)) >= x and close to it.
+  t_seed(7);
+  for i in 0..2000 {
+    var ns: int64 = (int64)(t_rand() >> 20);
+    var back_ns: int64 = grpc_timeout_decode(timeout(ns));
+    t_ok("rt >= {ns}", back_ns >= ns);
+    t_ok("rt close {ns}", back_ns - ns <= ns / 10000 + 1);
+  }
+
+  // Contexts.
+  var root: GrpcContext;
+  grpc_ctx_init(&root, GRPC_NO_DEADLINE);
+  t_eq("root ok", grpc_ctx_err(&root), GRPC_OK);
+  var child: GrpcContext;
+  grpc_ctx_child(&child, &root, grpc_deadline_after(60000000000));
+  t_eq("child ok", grpc_ctx_err(&child), GRPC_OK);
+  grpc_cancel(&root.cancel, GRPC_CANCELLED);
+  t_eq("child sees parent", grpc_ctx_err(&child), GRPC_CANCELLED);
+  var late: GrpcContext;
+  grpc_ctx_init(&late, grpc_deadline_after(-5));
+  t_eq("past deadline", grpc_ctx_err(&late), GRPC_DEADLINE_EXCEEDED);
+  t_eq("min", grpc_deadline_min(0, 5), 5);
+  t_eq("min2", grpc_deadline_min(9, 5), 5);
+  arena_free(a);
+  return t_done("metadata");
+}
