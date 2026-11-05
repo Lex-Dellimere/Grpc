@@ -1,0 +1,207 @@
+// Fuzzing: random header blocks into the header parsers, and random
+// events into a server and into a client call. Nothing may crash or hang.
+import "grpc/grpc";
+import "tutil";
+import "std/mem";
+import "std/arena";
+import "std/hpack";
+
+const NAMES: string[16] = [
+  ":method", ":path", ":status", "content-type", "grpc-timeout", "grpc-encoding",
+  "grpc-status", "grpc-message", "grpc-status-details-bin", "x-bin", "x-key", "te",
+  "grpc-accept-encoding", "grpc-retry-pushback-ms", "Bad Key", ":authority"
+];
+const VALUES: string[12] = [
+  "POST", "/a.B/C", "200", "application/grpc", "1S", "gzip", "14", "%41%zz",
+  "AAAA", "application/grpc+proto", "99999999H", "-5"
+];
+
+var g_rand_bytes: uint8[512];
+
+fn rand_value(a: Arena*) -> string {
+  if (t_rand() % 2 == 0) { return VALUES[t_rand() % 12]; }
+  var n: int64 = (int64)(t_rand() % 40);
+  var p: uint8* = (uint8*)arena_alloc(a, n + 1);
+  for i in 0..n { p[i] = (uint8)(t_rand() & 255); }
+  var s: string;
+  s.chars = p;
+  s.length = (uint64)n;
+  return s;
+}
+
+fn rand_headers(a: Arena*, hs: HpackHeader*, max: int64) -> int64 {
+  var n: int64 = (int64)(t_rand() % (uint64)max);
+  for i in 0..n {
+    var h: HpackHeader;
+    h.name = NAMES[t_rand() % 16];
+    h.value = rand_value(a);
+    hs[i] = h;
+  }
+  return n;
+}
+
+// Server side: random events from a raw client end.
+var g_server_msgs: int64 = 0;
+
+fn any_msg(u: rawptr, c: GrpcCall*, m: GrpcBytes*) {
+  g_server_msgs = g_server_msgs + 1;
+  if (t_rand() % 3 == 0) { grpc_srv_send(c, *m); }
+  if (t_rand() % 5 == 0) { grpc_srv_finish(c, grpc_status(GRPC_OK, "")); }
+}
+
+fn any_close(u: rawptr, c: GrpcCall*) {
+  if (!c->ending) { grpc_srv_finish(c, grpc_status(GRPC_OK, "")); }
+}
+
+fn any_cancel(u: rawptr, c: GrpcCall*) {
+  grpc_srv_finish(c, grpc_status(GRPC_CANCELLED, ""));
+}
+
+// Client side: the idle hook plays a broken server.
+struct Bad {
+  t: GrpcTransport;
+  a: Arena*;
+  steps: int32;
+}
+
+fn bad_server(u: rawptr) {
+  var b: Bad* = (Bad*)u;
+  var ev: GrpcTEvent;
+  while (b->t.poll(b->t.user, &ev, 0) > 0) { }
+  if (b->steps > 6) { return; }
+  b->steps = b->steps + 1;
+  var hs: HpackHeader[12];
+  var stream: int64 = 1 + (int64)(t_rand() % 3) * 2;
+  switch ((int32)(t_rand() % 4)) {
+    case 0: {
+      var n: int64 = rand_headers(b->a, &hs[0], 12);
+      b->t.send_headers(b->t.user, stream, &hs[0], n, t_rand() % 2 == 0);
+    }
+    case 1: {
+      var k: int64 = (int64)(t_rand() % 64);
+      for i in 0..k { g_rand_bytes[i] = (uint8)(t_rand() & 255); }
+      if (k > 0 && t_rand() % 2 == 0) { g_rand_bytes[0] = 0; }
+      b->t.send_data(b->t.user, stream, &g_rand_bytes[0], k, t_rand() % 3 == 0);
+    }
+    case 2: { b->t.reset(b->t.user, stream, (int64)(t_rand() % 14)); }
+    default: {
+      var ok: HpackHeader[2];
+      ok[0].name = ":status";
+      ok[0].value = "200";
+      ok[1].name = "content-type";
+      ok[1].value = "application/grpc";
+      b->t.send_headers(b->t.user, stream, &ok[0], 2, false);
+    }
+  }
+}
+
+fn main() -> int32 {
+  t_seed(1234);
+  var a: Arena* = arena_init(0);
+  var hs: HpackHeader[16];
+  for round in 0..20000 {
+    var n: int64 = rand_headers(a, &hs[0], 16);
+    var md: GrpcMetadata;
+    grpc_md_init(&md, a);
+    var ri: GrpcRequestInfo;
+    grpc_request_parse(&hs[0], n, &md, &ri);
+    var si: GrpcResponseInfo;
+    grpc_response_parse(a, &hs[0], n, &md, &si);
+    if (round % 1000 == 0) { arena_reset(a); }
+  }
+  t_ok("header parsers survived", true);
+
+  // A server fed random events.
+  var sopts: GrpcServerOptions;
+  sopts.max_recv = 1000;
+  var srv: GrpcServer;
+  grpc_server_init(&srv, &sopts);
+  var d: GrpcMethodDesc;
+  d.on_message = &any_msg;
+  d.on_half_close = &any_close;
+  d.on_cancel = &any_cancel;
+  for k in 0..4 {
+    d.path = "/a.B/C";
+    if (k == 1) { d.path = "/a.B/S"; }
+    d.kind = (int32)k;
+    grpc_server_add(&srv, &d);
+  }
+  for round in 0..300 {
+    var pipe: GrpcMemPipe;
+    grpc_mem_pipe_init(&pipe);
+    var sc: GrpcServerConn;
+    grpc_server_conn_init(&sc, &srv, grpc_mem_transport(&pipe.server));
+    var ct: GrpcTransport = grpc_mem_transport(&pipe.client);
+    for step in 0..40 {
+      var stream: int64 = 1 + (int64)(t_rand() % 4) * 2;
+      var what: uint64 = t_rand() % 5;
+      if (what == 0) {
+        var good: HpackHeader[4];
+        good[0].name = ":method";
+        good[0].value = "POST";
+        good[1].name = ":path";
+        good[1].value = "/a.B/C";
+        if (t_rand() % 2 == 0) { good[1].value = "/a.B/S"; }
+        good[2].name = "content-type";
+        good[2].value = "application/grpc";
+        good[3].name = "grpc-encoding";
+        good[3].value = VALUES[t_rand() % 12];
+        ct.send_headers(ct.user, stream, &good[0], 3 + (int64)(t_rand() % 2), t_rand() % 4 == 0);
+      } else if (what == 1) {
+        var n2: int64 = rand_headers(a, &hs[0], 16);
+        ct.send_headers(ct.user, stream, &hs[0], n2, t_rand() % 2 == 0);
+      } else if (what == 2) {
+        var k2: int64 = (int64)(t_rand() % 200);
+        for i in 0..k2 { g_rand_bytes[i] = (uint8)(t_rand() & 255); }
+        if (k2 > 5 && t_rand() % 2 == 0) {
+          g_rand_bytes[0] = (uint8)(t_rand() % 2);
+          g_rand_bytes[1] = 0;
+          g_rand_bytes[2] = 0;
+          g_rand_bytes[3] = 0;
+          g_rand_bytes[4] = (uint8)(k2 - 5);
+        }
+        ct.send_data(ct.user, stream, &g_rand_bytes[0], k2, t_rand() % 3 == 0);
+      } else if (what == 3) {
+        ct.reset(ct.user, stream, GRPC_H2_CANCEL);
+      } else {
+        ct.ping(ct.user);
+      }
+      grpc_server_conn_poll(&sc);
+      var ev: GrpcTEvent;
+      while (ct.poll(ct.user, &ev, 0) > 0) { }
+    }
+    grpc_server_conn_free(&sc);
+    grpc_mem_pipe_free(&pipe);
+    arena_reset(a);
+  }
+  t_ok("server survived", g_server_msgs >= 0);
+
+  // Client calls answered by a broken server; each must end by its deadline.
+  for round in 0..150 {
+    var pipe2: GrpcMemPipe;
+    grpc_mem_pipe_init(&pipe2);
+    var b: Bad;
+    b.t = grpc_mem_transport(&pipe2.server);
+    b.a = a;
+    pipe2.client.idle = &bad_server;
+    pipe2.client.idle_user = (rawptr)&b;
+    var copts: GrpcChannelOptions;
+    var ch: GrpcChannel;
+    grpc_channel_init(&ch, grpc_mem_transport(&pipe2.client), &copts);
+    var o: GrpcCallOptions = grpc_call_options();
+    o.timeout_ns = 5000000;
+    var c: GrpcCall* = grpc_call_start(&ch, "/a.B/C", GRPC_BIDI_STREAMING, &o);
+    grpc_call_send(c, grpc_bytes("hi"));
+    var m: GrpcBytes;
+    while (grpc_call_recv(c, &m)) { }
+    var st: GrpcStatus = grpc_call_finish(c);
+    t_ok("client ended {round}", st.code >= 0 && st.code <= 16);
+    grpc_call_free(c);
+    grpc_channel_close(&ch);
+    grpc_mem_pipe_free(&pipe2);
+    arena_reset(a);
+  }
+  grpc_server_free(&srv);
+  arena_free(a);
+  return t_done("fuzz");
+}

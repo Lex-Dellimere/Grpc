@@ -15,3 +15,4 @@ import "grpc/client";
 import "grpc/server";
 import "grpc/health";
 import "grpc/reflection";
+import "grpc/errors";

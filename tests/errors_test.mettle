@@ -1,0 +1,49 @@
+// Rich error details: pack, carry, unpack.
+import "grpc/errors";
+import "grpc/status";
+import "grpc/gen/google/protobuf/any_pb";
+import "grpc/gen/google/rpc/status_pb";
+import "grpc/gen/google/rpc/error_details_pb";
+import "codec/core/rev";
+import "codec/core/status";
+import "tutil";
+
+fn main() -> int32 {
+  var info: GrpcPbErrorInfo;
+  GrpcPbErrorInfo_init(&info);
+  info.reason = "QUOTA";
+  info.domain = "example.com";
+  var w: CodecRev;
+  var bytes: string = GrpcPbErrorInfo_serialize(&info, &w);
+  var any: GrpcPbAny;
+  grpc_any_pack(&any, "google.rpc.ErrorInfo", bytes);
+  t_ok("any is", grpc_any_is(&any, "google.rpc.ErrorInfo"));
+  t_ok("any is not", !grpc_any_is(&any, "google.rpc.RetryInfo"));
+  t_ok("any suffix only", !grpc_any_is(&any, "rpc.ErrorInfo"));
+  var st: GrpcStatus = grpc_status_rich(GRPC_RESOURCE_EXHAUSTED, "slow down", &any, 1);
+  t_eq("code", st.code, GRPC_RESOURCE_EXHAUSTED);
+
+  var pb: GrpcPbStatus;
+  GrpcPbStatus_init(&pb);
+  t_ok("details decode", grpc_status_details(&st, &pb));
+  t_eq("detail count", pb.details.len, 1);
+  t_str("detail message", pb.message, "slow down");
+  var back: GrpcPbErrorInfo;
+  GrpcPbErrorInfo_init(&back);
+  t_ok("detail type", grpc_any_is(&pb.details.data[0], "google.rpc.ErrorInfo"));
+  t_eq("detail unpack", GrpcPbErrorInfo_decode(&back, pb.details.data[0].value), CODEC_OK);
+  t_str("reason", back.reason, "QUOTA");
+  t_str("domain", back.domain, "example.com");
+
+  // A code mismatch means the details are ignored.
+  var other: GrpcStatus = st;
+  other.code = GRPC_INTERNAL;
+  var pb2: GrpcPbStatus;
+  GrpcPbStatus_init(&pb2);
+  t_ok("mismatch ignored", !grpc_status_details(&other, &pb2));
+  var none: GrpcStatus = grpc_status(GRPC_OK, "");
+  t_ok("no details", !grpc_status_details(&none, &pb2));
+  grpc_status_free(&st);
+  codec_rev_free(&w);
+  return t_done("errors");
+}
