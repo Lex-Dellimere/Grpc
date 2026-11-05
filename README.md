@@ -31,7 +31,7 @@ fn deps() {
   mb_dep_path("codec", "../codec");
   mb_dep_path("press", "../press");
   mb_dep_path("mtls", "../mtls");        // for grpc/tls
-  mb_dep_path("crypto", "../cryptex");
+  mb_dep_path("cryptex", "../cryptex");
 }
 ```
 

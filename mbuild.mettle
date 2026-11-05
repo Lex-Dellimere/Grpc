@@ -5,7 +5,7 @@
 import "mbuild/api";
 
 fn project() {
-  mb_package("grpc", "0.1.0");
+  mb_package("grpc", "0.1.1");
   mb_meta("description", "gRPC clients and servers in pure Mettle");
   mb_meta("license", "Apache-2.0");
   mb_meta("repository", "https://github.com/Lex-Dellimere/Grpc");
@@ -21,7 +21,7 @@ fn deps() {
   mb_dep_path("press", "../press");
   mb_dep_path("codec", "../codec");
   mb_dep_path("mtls", "../mtls");
-  mb_dep_path("crypto", "../cryptex");
+  mb_dep_path("cryptex", "../cryptex");
 }
 
 // gen: rebuilds the generated code in src/gen and tests/gen: messages with
