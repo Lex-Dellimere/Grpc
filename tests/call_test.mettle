@@ -210,6 +210,18 @@ fn main() -> int32 {
   t_ok("trailer md", grpc_md_get(grpc_call_trailers_md(c), "x-trail", &v) && v == "hello");
   grpc_call_free(c);
 
+  // Metadata through the call options, as unary stubs use it.
+  var omd: GrpcMetadata;
+  grpc_md_init(&omd, a);
+  grpc_md_add(&omd, "x-echo", "via-options");
+  var mo: GrpcCallOptions = grpc_call_options();
+  mo.md = &omd;
+  c = grpc_call_start(&ch, "/test.Echo/Plain", GRPC_UNARY, &mo);
+  grpc_call_send(c, grpc_bytes("x"));
+  grpc_call_finish(c);
+  t_ok("options md", grpc_md_get(grpc_call_headers_md(c), "x-echo", &v) && v == "via-options");
+  grpc_call_free(c);
+
   // grpc_unary helper and compression of a big message.
   var bigs: uint8* = (uint8*)malloc(150000);
   for i in 0..150000 { bigs[i] = (uint8)(97 + (i / 13) % 7); }

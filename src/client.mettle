@@ -67,6 +67,7 @@ export struct GrpcCallOptions {
   parent: GrpcContext*;         // propagate deadline and cancellation
   wait_for_ready: int32;        // -1: from config (default false), 0, 1
   compress: bool;               // compress with the channel's send_enc
+  md: GrpcMetadata*;            // request metadata to send (copied), or 0
 }
 
 const DEFAULT_RETRY_BUFFER: int64 = 262144;
@@ -775,6 +776,7 @@ export fn grpc_call_start(ch: GrpcChannel*, path: string, kind: int32, o: GrpcCa
     mc->wait_for_ready = o->wait_for_ready;
     c->mc = mc;
   }
+  if (o->md != 0) { grpc_md_append(&c->send_md, o->md); }
   add_call(ch, c);
   return c;
 }

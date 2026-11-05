@@ -1,0 +1,654 @@
+// gRPC interop test client: runs one test case of
+// doc/interop-test-descriptions.md against grpc.testing.TestService over
+// plaintext h2c.
+//
+//   interop_client --server_host=127.0.0.1 --server_port=N --test_case=NAME
+//
+// --probe=false skips the probe call of client_compressed_unary and
+// client_compressed_streaming, for servers (grpc-go) that do not check
+// expect_compressed.
+//
+// Prints "PASS name" and exits 0, or prints "FAIL name: reason" and exits 1.
+import "std/io";
+import "std/mem";
+import "std/core";
+import "std/conv";
+import "codec/core/list";
+import "codec/core/rev";
+import "grpc/grpc";
+import "gen/grpc/testing/test_grpc";
+
+const BODY_MAX: int64 = 524288;
+const TIMEOUT_NS: int64 = 20000000000;
+var g_zeros: uint8*;
+var g_probe: bool = true;   // --probe=false skips the INVALID_ARGUMENT probe calls
+
+// ---- helpers ----
+
+fn st_text(st: GrpcStatus) -> string {
+  return grpc_code_name(st.code) + ": " + st.message;
+}
+
+// A finished call's status with its text copied, so it outlives the call.
+struct Res {
+  code: int32;
+  text: string;
+}
+
+fn res_of(st: GrpcStatus) -> Res {
+  var r: Res;
+  r.code = st.code;
+  r.text = st_text(st);
+  return r;
+}
+
+fn call_opts() -> GrpcCallOptions {
+  var o: GrpcCallOptions = grpc_call_options();
+  o.timeout_ns = TIMEOUT_NS;
+  return o;
+}
+
+fn make_payload(n: int64) -> GtPayload* {
+  var p: GtPayload* = new GtPayload;
+  p->body.chars = g_zeros;
+  p->body.length = (uint64)n;
+  return p;
+}
+
+fn bool_val(v: bool) -> GtBoolValue* {
+  var b: GtBoolValue* = new GtBoolValue;
+  b->value = v;
+  return b;
+}
+
+fn echo_status(code: int32, msg: string) -> GtEchoStatus* {
+  var e: GtEchoStatus* = new GtEchoStatus;
+  e->code = code;
+  e->message = msg;
+  return e;
+}
+
+fn fill_simple(r: GtSimpleRequest*, resp_size: int32, body: int64) {
+  GtSimpleRequest_init(r);
+  r->response_size = resp_size;
+  r->payload = make_payload(body);
+}
+
+// comp: -1 leaves `compressed` unset, 0 is false, 1 is true.
+fn add_param(r: GtStreamingOutputCallRequest*, size: int32, comp: int32) {
+  var p: GtResponseParameters;
+  GtResponseParameters_init(&p);
+  p.size = size;
+  if (comp >= 0) { p.compressed = bool_val(comp == 1); }
+  codec_list_push(&r->response_parameters, p);
+}
+
+fn body_len(p: GtPayload*) -> int64 {
+  if (p == 0) { return -1; }
+  for i in 0..(int64)p->body.length {
+    if (p->body.chars[i] != 0) { return -2; }
+  }
+  return (int64)p->body.length;
+}
+
+fn size_text(got: int64, want: int64) -> string {
+  if (got == -1) { return "no payload, want {want} bytes"; }
+  if (got == -2) { return "payload is not all zeros"; }
+  return "payload is {got} bytes, want {want}";
+}
+
+// One UnaryCall. *got is the response payload size (see body_len).
+fn do_unary(ch: GrpcChannel*, req: GtSimpleRequest*, o: GrpcCallOptions*, got: int64*) -> GrpcStatus {
+  var resp: GtSimpleResponse;
+  GtSimpleResponse_init(&resp);
+  var buf: GrpcBytes;
+  var st: GrpcStatus = GtTestService_UnaryCall(ch, req, &resp, &buf, o);
+  *got = body_len(resp.payload);
+  GtSimpleResponse_free(&resp);
+  if (buf.data != 0) { free(buf.data); }
+  return st;
+}
+
+// Reads every response of a streaming call into sizes; returns the count.
+fn recv_all(c: GrpcCall*, sizes: int64*, cap: int64) -> int64 {
+  var resp: GtStreamingOutputCallResponse;
+  GtStreamingOutputCallResponse_init(&resp);
+  var n: int64 = 0;
+  while (GtTestService_FullDuplexCall_recv(c, &resp)) {
+    if (n < cap) { sizes[n] = body_len(resp.payload); }
+    n = n + 1;
+  }
+  GtStreamingOutputCallResponse_free(&resp);
+  return n;
+}
+
+fn bin_md(c: GrpcCall*) {
+  var bin: uint8[3] = [171, 171, 171];
+  var v: string;
+  v.chars = &bin[0];
+  v.length = 3;
+  grpc_md_add(grpc_call_md(c), "x-grpc-test-echo-initial", "test_initial_metadata_value");
+  grpc_md_add(grpc_call_md(c), "x-grpc-test-echo-trailing-bin", v);
+}
+
+// "" when the call's headers and trailers carry the echoed metadata.
+fn check_md(c: GrpcCall*) -> string {
+  var v: string;
+  if (!grpc_md_get(grpc_call_headers_md(c), "x-grpc-test-echo-initial", &v)) {
+    return "x-grpc-test-echo-initial missing from the response headers";
+  }
+  if (v != "test_initial_metadata_value") { return "x-grpc-test-echo-initial is '{v}'"; }
+  if (!grpc_md_get(grpc_call_trailers_md(c), "x-grpc-test-echo-trailing-bin", &v)) {
+    return "x-grpc-test-echo-trailing-bin missing from the trailers";
+  }
+  if (v.length != 3 || v.chars[0] != 171 || v.chars[1] != 171 || v.chars[2] != 171) {
+    return "x-grpc-test-echo-trailing-bin has the wrong bytes ({v.length} long)";
+  }
+  return "";
+}
+
+// ---- test cases: each returns "" on success, else the reason ----
+
+fn t_empty_unary(ch: GrpcChannel*) -> string {
+  var o: GrpcCallOptions = call_opts();
+  var req: GtEmpty;
+  var resp: GtEmpty;
+  GtEmpty_init(&req);
+  GtEmpty_init(&resp);
+  var buf: GrpcBytes;
+  var st: GrpcStatus = GtTestService_EmptyCall(ch, &req, &resp, &buf, &o);
+  if (st.code != GRPC_OK) { return st_text(st); }
+  if (buf.len != 0) { return "response is {buf.len} bytes, want 0"; }
+  return "";
+}
+
+fn t_large_unary(ch: GrpcChannel*) -> string {
+  var o: GrpcCallOptions = call_opts();
+  var req: GtSimpleRequest;
+  fill_simple(&req, 314159, 271828);
+  var got: int64 = 0;
+  var st: GrpcStatus = do_unary(ch, &req, &o, &got);
+  GtSimpleRequest_free(&req);
+  if (st.code != GRPC_OK) { return st_text(st); }
+  if (got != 314159) { return size_text(got, 314159); }
+  return "";
+}
+
+fn t_client_streaming(ch: GrpcChannel*) -> string {
+  var o: GrpcCallOptions = call_opts();
+  var c: GrpcCall* = GtTestService_StreamingInputCall_start(ch, &o);
+  var sizes: int64[4] = [27182, 8, 1828, 45904];
+  for i in 0..4 {
+    var req: GtStreamingInputCallRequest;
+    GtStreamingInputCallRequest_init(&req);
+    req.payload = make_payload(sizes[i]);
+    GtTestService_StreamingInputCall_write(c, &req);
+    GtStreamingInputCallRequest_free(&req);
+  }
+  var resp: GtStreamingInputCallResponse;
+  GtStreamingInputCallResponse_init(&resp);
+  var st: GrpcStatus = GtTestService_StreamingInputCall_finish(c, &resp);
+  var total: int32 = resp.aggregated_payload_size;
+  var why: string = "";
+  if (st.code != GRPC_OK) {
+    why = st_text(st);
+  } else if (total != 74922) {
+    why = "aggregated_payload_size is {total}, want 74922";
+  }
+  grpc_call_free(c);
+  return why;
+}
+
+fn t_server_streaming(ch: GrpcChannel*) -> string {
+  var o: GrpcCallOptions = call_opts();
+  var req: GtStreamingOutputCallRequest;
+  GtStreamingOutputCallRequest_init(&req);
+  var want: int64[4] = [31415, 9, 2653, 58979];
+  for i in 0..4 { add_param(&req, (int32)want[i], -1); }
+  var c: GrpcCall* = GtTestService_StreamingOutputCall_start(ch, &req, &o);
+  GtStreamingOutputCallRequest_free(&req);
+  var resp: GtStreamingOutputCallResponse;
+  GtStreamingOutputCallResponse_init(&resp);
+  var n: int64 = 0;
+  var why: string = "";
+  while (GtTestService_StreamingOutputCall_recv(c, &resp)) {
+    var got: int64 = body_len(resp.payload);
+    if (n < 4 && got != want[n] && why.length == 0) { why = "response {n}: " + size_text(got, want[n]); }
+    n = n + 1;
+  }
+  GtStreamingOutputCallResponse_free(&resp);
+  var st: Res = res_of(grpc_call_finish(c));
+  grpc_call_free(c);
+  if (why.length > 0) { return why; }
+  if (st.code != GRPC_OK) { return st.text; }
+  if (n != 4) { return "{n} responses, want 4"; }
+  return "";
+}
+
+fn t_ping_pong(ch: GrpcChannel*) -> string {
+  var o: GrpcCallOptions = call_opts();
+  var c: GrpcCall* = GtTestService_FullDuplexCall_start(ch, &o);
+  var want: int64[4] = [31415, 9, 2653, 58979];
+  var body: int64[4] = [27182, 8, 1828, 45904];
+  var resp: GtStreamingOutputCallResponse;
+  GtStreamingOutputCallResponse_init(&resp);
+  var why: string = "";
+  for i in 0..4 {
+    if (why.length > 0) { break; }
+    var req: GtStreamingOutputCallRequest;
+    GtStreamingOutputCallRequest_init(&req);
+    add_param(&req, (int32)want[i], -1);
+    req.payload = make_payload(body[i]);
+    GtTestService_FullDuplexCall_write(c, &req);
+    GtStreamingOutputCallRequest_free(&req);
+    if (!GtTestService_FullDuplexCall_recv(c, &resp)) {
+      why = "no response to request {i}";
+    } else {
+      var got: int64 = body_len(resp.payload);
+      if (got != want[i]) { why = "response {i}: " + size_text(got, want[i]); }
+    }
+  }
+  grpc_call_close_send(c);
+  if (why.length == 0 && GtTestService_FullDuplexCall_recv(c, &resp)) { why = "more than four responses"; }
+  GtStreamingOutputCallResponse_free(&resp);
+  var st: Res = res_of(grpc_call_finish(c));
+  grpc_call_free(c);
+  if (why.length > 0) { return why; }
+  if (st.code != GRPC_OK) { return st.text; }
+  return "";
+}
+
+fn t_empty_stream(ch: GrpcChannel*) -> string {
+  var o: GrpcCallOptions = call_opts();
+  var c: GrpcCall* = GtTestService_FullDuplexCall_start(ch, &o);
+  grpc_call_close_send(c);
+  var sizes: int64[1];
+  var n: int64 = recv_all(c, &sizes[0], 1);
+  var st: Res = res_of(grpc_call_finish(c));
+  grpc_call_free(c);
+  if (st.code != GRPC_OK) { return st.text; }
+  if (n != 0) { return "{n} responses, want 0"; }
+  return "";
+}
+
+fn t_timeout_on_sleeping_server(ch: GrpcChannel*) -> string {
+  var o: GrpcCallOptions = call_opts();
+  o.timeout_ns = 1000000;
+  var c: GrpcCall* = GtTestService_FullDuplexCall_start(ch, &o);
+  var req: GtStreamingOutputCallRequest;
+  GtStreamingOutputCallRequest_init(&req);
+  req.payload = make_payload(27182);
+  GtTestService_FullDuplexCall_write(c, &req);
+  GtStreamingOutputCallRequest_free(&req);
+  var sizes: int64[1];
+  recv_all(c, &sizes[0], 1);
+  var st: Res = res_of(grpc_call_finish(c));
+  grpc_call_free(c);
+  if (st.code != GRPC_DEADLINE_EXCEEDED) { return "want DEADLINE_EXCEEDED, got " + st.text; }
+  return "";
+}
+
+fn t_cancel_after_begin(ch: GrpcChannel*) -> string {
+  var o: GrpcCallOptions = call_opts();
+  var c: GrpcCall* = GtTestService_StreamingInputCall_start(ch, &o);
+  grpc_call_cancel(c);
+  var st: Res = res_of(grpc_call_finish(c));
+  grpc_call_free(c);
+  if (st.code != GRPC_CANCELLED) { return "want CANCELLED, got " + st.text; }
+  return "";
+}
+
+fn t_cancel_after_first_response(ch: GrpcChannel*) -> string {
+  var o: GrpcCallOptions = call_opts();
+  var c: GrpcCall* = GtTestService_FullDuplexCall_start(ch, &o);
+  var req: GtStreamingOutputCallRequest;
+  GtStreamingOutputCallRequest_init(&req);
+  add_param(&req, 31415, -1);
+  req.payload = make_payload(27182);
+  GtTestService_FullDuplexCall_write(c, &req);
+  GtStreamingOutputCallRequest_free(&req);
+  var resp: GtStreamingOutputCallResponse;
+  GtStreamingOutputCallResponse_init(&resp);
+  var why: string = "";
+  if (!GtTestService_FullDuplexCall_recv(c, &resp)) { why = "no response before the cancel"; }
+  GtStreamingOutputCallResponse_free(&resp);
+  grpc_call_cancel(c);
+  var st: Res = res_of(grpc_call_finish(c));
+  grpc_call_free(c);
+  if (why.length > 0) { return why; }
+  if (st.code != GRPC_CANCELLED) { return "want CANCELLED, got " + st.text; }
+  return "";
+}
+
+// UnaryCall then FullDuplexCall, each asking the server to end with
+// (code 2, msg). The status must come back unchanged.
+fn status_both(ch: GrpcChannel*, msg: string, with_duplex: bool) -> string {
+  var o: GrpcCallOptions = call_opts();
+  var req: GtSimpleRequest;
+  GtSimpleRequest_init(&req);
+  req.response_status = echo_status(2, msg);
+  var got: int64 = 0;
+  var st: GrpcStatus = do_unary(ch, &req, &o, &got);
+  GtSimpleRequest_free(&req);
+  if (st.code != 2) { return "UnaryCall: want code 2, got " + st_text(st); }
+  if (st.message != msg) { return "UnaryCall: message is '{st.message}', want '{msg}'"; }
+  grpc_status_free(&st);
+  if (!with_duplex) { return ""; }
+
+  var c: GrpcCall* = GtTestService_FullDuplexCall_start(ch, &o);
+  var dreq: GtStreamingOutputCallRequest;
+  GtStreamingOutputCallRequest_init(&dreq);
+  dreq.response_status = echo_status(2, msg);
+  GtTestService_FullDuplexCall_write(c, &dreq);
+  GtStreamingOutputCallRequest_free(&dreq);
+  grpc_call_close_send(c);
+  var sizes: int64[1];
+  recv_all(c, &sizes[0], 1);
+  var fst: GrpcStatus = grpc_call_finish(c);
+  var why: string = "";
+  if (fst.code != 2) {
+    why = "FullDuplexCall: want code 2, got " + st_text(fst);
+  } else if (fst.message != msg) {
+    why = "FullDuplexCall: message is '{fst.message}', want '{msg}'";
+  }
+  grpc_call_free(c);
+  return why;
+}
+
+fn t_status_code_and_message(ch: GrpcChannel*) -> string {
+  return status_both(ch, "test status message", true);
+}
+
+fn t_special_status_message(ch: GrpcChannel*) -> string {
+  return status_both(ch, "\t\ntest with whitespace\r\nand Unicode BMP ☺ and non-BMP 😈\t\n", false);
+}
+
+fn t_custom_metadata(ch: GrpcChannel*) -> string {
+  var o: GrpcCallOptions = call_opts();
+
+  // UnaryCall by hand: the unary stub has no way to attach metadata.
+  var req: GtSimpleRequest;
+  fill_simple(&req, 314159, 271828);
+  var c: GrpcCall* = grpc_call_start(ch, GtTestService_UnaryCall_PATH, GRPC_UNARY, &o);
+  bin_md(c);
+  var w: CodecRev;
+  grpc_call_send(c, grpc_bytes(GtSimpleRequest_serialize(&req, &w)));
+  codec_rev_free(&w);
+  GtSimpleRequest_free(&req);
+  grpc_call_close_send(c);
+  var m: GrpcBytes;
+  var why: string = "";
+  var resp: GtSimpleResponse;
+  GtSimpleResponse_init(&resp);
+  if (!grpc_call_recv(c, &m)) {
+    why = "UnaryCall: no response";
+  } else if (GtSimpleResponse_decode(&resp, grpc_bytes_str(m)) != CODEC_OK) {
+    why = "UnaryCall: cannot decode the response";
+  } else if (body_len(resp.payload) != 314159) {
+    why = "UnaryCall: " + size_text(body_len(resp.payload), 314159);
+  }
+  GtSimpleResponse_free(&resp);
+  var st: GrpcStatus = grpc_call_finish(c);
+  if (why.length == 0 && st.code != GRPC_OK) { why = "UnaryCall: " + st_text(st); }
+  if (why.length == 0) {
+    why = check_md(c);
+    if (why.length > 0) { why = "UnaryCall: " + why; }
+  }
+  grpc_call_free(c);
+  if (why.length > 0) { return why; }
+
+  // FullDuplexCall.
+  c = GtTestService_FullDuplexCall_start(ch, &o);
+  bin_md(c);
+  var dreq: GtStreamingOutputCallRequest;
+  GtStreamingOutputCallRequest_init(&dreq);
+  add_param(&dreq, 314159, -1);
+  dreq.payload = make_payload(271828);
+  GtTestService_FullDuplexCall_write(c, &dreq);
+  GtStreamingOutputCallRequest_free(&dreq);
+  grpc_call_close_send(c);
+  var sizes: int64[2];
+  var n: int64 = recv_all(c, &sizes[0], 2);
+  st = grpc_call_finish(c);
+  if (st.code != GRPC_OK) {
+    why = "FullDuplexCall: " + st_text(st);
+  } else if (n != 1 || sizes[0] != 314159) {
+    why = "FullDuplexCall: {n} responses, first has size {sizes[0]}";
+  } else {
+    why = check_md(c);
+    if (why.length > 0) { why = "FullDuplexCall: " + why; }
+  }
+  grpc_call_free(c);
+  return why;
+}
+
+fn t_unimplemented_method(ch: GrpcChannel*) -> string {
+  var o: GrpcCallOptions = call_opts();
+  var req: GtEmpty;
+  var resp: GtEmpty;
+  GtEmpty_init(&req);
+  GtEmpty_init(&resp);
+  var buf: GrpcBytes;
+  var st: GrpcStatus = GtTestService_UnimplementedCall(ch, &req, &resp, &buf, &o);
+  if (st.code != GRPC_UNIMPLEMENTED) { return "want UNIMPLEMENTED, got " + st_text(st); }
+  return "";
+}
+
+fn t_unimplemented_service(ch: GrpcChannel*) -> string {
+  var o: GrpcCallOptions = call_opts();
+  var req: GtEmpty;
+  var resp: GtEmpty;
+  GtEmpty_init(&req);
+  GtEmpty_init(&resp);
+  var buf: GrpcBytes;
+  var st: GrpcStatus = GtUnimplementedService_UnimplementedCall(ch, &req, &resp, &buf, &o);
+  if (st.code != GRPC_UNIMPLEMENTED) { return "want UNIMPLEMENTED, got " + st_text(st); }
+  return "";
+}
+
+// One UnaryCall asking for expect_compressed = expect; compress sets the
+// request side. Returns the status, size is the response payload size.
+fn compressed_unary(ch: GrpcChannel*, compress: bool, expect: bool, got: int64*) -> GrpcStatus {
+  var o: GrpcCallOptions = call_opts();
+  o.compress = compress;
+  var req: GtSimpleRequest;
+  fill_simple(&req, 314159, 271828);
+  req.expect_compressed = bool_val(expect);
+  var st: GrpcStatus = do_unary(ch, &req, &o, got);
+  GtSimpleRequest_free(&req);
+  return st;
+}
+
+fn t_client_compressed_unary(ch: GrpcChannel*) -> string {
+  var got: int64 = 0;
+  // Probe: an uncompressed request that claims to be compressed must fail.
+  var st: GrpcStatus;
+  if (g_probe) {
+    st = compressed_unary(ch, false, true, &got);
+    if (st.code != GRPC_INVALID_ARGUMENT) { return "probe: want INVALID_ARGUMENT, got " + st_text(st); }
+    grpc_status_free(&st);
+  }
+  st = compressed_unary(ch, true, true, &got);
+  if (st.code != GRPC_OK) { return "compressed request: " + st_text(st); }
+  if (got != 314159) { return "compressed request: " + size_text(got, 314159); }
+  st = compressed_unary(ch, false, false, &got);
+  if (st.code != GRPC_OK) { return "uncompressed request: " + st_text(st); }
+  if (got != 314159) { return "uncompressed request: " + size_text(got, 314159); }
+  return "";
+}
+
+// The client cannot see the message flag of a response, so only the
+// payload size is checked.
+fn t_server_compressed_unary(ch: GrpcChannel*) -> string {
+  for i in 0..2 {
+    var o: GrpcCallOptions = call_opts();
+    var req: GtSimpleRequest;
+    fill_simple(&req, 314159, 271828);
+    req.response_compressed = bool_val(i == 0);
+    var got: int64 = 0;
+    var st: GrpcStatus = do_unary(ch, &req, &o, &got);
+    GtSimpleRequest_free(&req);
+    if (st.code != GRPC_OK) { return "response_compressed={i == 0}: " + st_text(st); }
+    if (got != 314159) { return "response_compressed={i == 0}: " + size_text(got, 314159); }
+  }
+  return "";
+}
+
+// One StreamingInputCall of two messages (expect_compressed true then false)
+// where the first is sent compressed. With probe, the call sends only an
+// uncompressed first message and must fail.
+fn streaming_input_expect(ch: GrpcChannel*, probe: bool, total: int32*) -> Res {
+  var o: GrpcCallOptions = call_opts();
+  o.compress = !probe;
+  var c: GrpcCall* = GtTestService_StreamingInputCall_start(ch, &o);
+  var req: GtStreamingInputCallRequest;
+  GtStreamingInputCallRequest_init(&req);
+  req.expect_compressed = bool_val(true);
+  req.payload = make_payload(27182);
+  GtTestService_StreamingInputCall_write(c, &req);
+  GtStreamingInputCallRequest_free(&req);
+  if (!probe) {
+    // Per message: the second one goes out uncompressed.
+    c->compress = false;
+    GtStreamingInputCallRequest_init(&req);
+    req.expect_compressed = bool_val(false);
+    req.payload = make_payload(45904);
+    GtTestService_StreamingInputCall_write(c, &req);
+    GtStreamingInputCallRequest_free(&req);
+  }
+  var resp: GtStreamingInputCallResponse;
+  GtStreamingInputCallResponse_init(&resp);
+  var st: Res = res_of(GtTestService_StreamingInputCall_finish(c, &resp));
+  *total = resp.aggregated_payload_size;
+  grpc_call_free(c);
+  return st;
+}
+
+fn t_client_compressed_streaming(ch: GrpcChannel*) -> string {
+  var total: int32 = 0;
+  var st: Res;
+  if (g_probe) {
+    st = streaming_input_expect(ch, true, &total);
+    if (st.code != GRPC_INVALID_ARGUMENT) { return "probe: want INVALID_ARGUMENT, got " + st.text; }
+  }
+  st = streaming_input_expect(ch, false, &total);
+  if (st.code != GRPC_OK) { return st.text; }
+  if (total != 73086) { return "aggregated_payload_size is {total}, want 73086"; }
+  return "";
+}
+
+fn compressed_out(ch: GrpcChannel*, sizes: int64*, n: int64*) -> Res {
+  var o: GrpcCallOptions = call_opts();
+  var req: GtStreamingOutputCallRequest;
+  GtStreamingOutputCallRequest_init(&req);
+  add_param(&req, 31415, 1);
+  add_param(&req, 92653, 0);
+  var c: GrpcCall* = GtTestService_StreamingOutputCall_start(ch, &req, &o);
+  GtStreamingOutputCallRequest_free(&req);
+  var resp: GtStreamingOutputCallResponse;
+  GtStreamingOutputCallResponse_init(&resp);
+  *n = 0;
+  while (GtTestService_StreamingOutputCall_recv(c, &resp)) {
+    if (*n < 2) { sizes[*n] = body_len(resp.payload); }
+    *n = *n + 1;
+  }
+  GtStreamingOutputCallResponse_free(&resp);
+  var st: Res = res_of(grpc_call_finish(c));
+  grpc_call_free(c);
+  return st;
+}
+
+// As for the unary case, only the payload sizes can be checked.
+fn t_server_compressed_streaming(ch: GrpcChannel*) -> string {
+  var sizes: int64[2];
+  var n: int64 = 0;
+  var st: Res = compressed_out(ch, &sizes[0], &n);
+  if (st.code != GRPC_OK) { return st.text; }
+  if (n != 2) { return "{n} responses, want 2"; }
+  if (sizes[0] != 31415) { return "response 0: " + size_text(sizes[0], 31415); }
+  if (sizes[1] != 92653) { return "response 1: " + size_text(sizes[1], 92653); }
+  return "";
+}
+
+// ---- main ----
+
+// The value of --name=value or --name value, or "".
+fn flag(argc: int32, argv: cstring*, name: string) -> string {
+  var empty: string = "";
+  for i in 1..argc {
+    var a: string = str_from_cstr(argv[i]);
+    if (a == name && i + 1 < argc) { return str_from_cstr(argv[i + 1]); }
+    var pre: string = name + "=";
+    if (str_starts_with(a, pre) != 0) { return str_slice(a, (int64)pre.length, (int64)a.length - (int64)pre.length); }
+  }
+  return empty;
+}
+
+fn parse_int(s: string) -> int32 {
+  var n: int32 = 0;
+  if (s.length == 0) { return -1; }
+  for i in 0..(int64)s.length {
+    var d: int32 = (int32)s.chars[i] - 48;
+    if (d < 0 || d > 9) { return -1; }
+    n = n * 10 + d;
+    if (n > 65535) { return -1; }
+  }
+  return n;
+}
+
+fn run_case(name: string, ch: GrpcChannel*) -> string {
+  if (name == "empty_unary") { return t_empty_unary(ch); }
+  if (name == "large_unary") { return t_large_unary(ch); }
+  if (name == "client_streaming") { return t_client_streaming(ch); }
+  if (name == "server_streaming") { return t_server_streaming(ch); }
+  if (name == "ping_pong") { return t_ping_pong(ch); }
+  if (name == "empty_stream") { return t_empty_stream(ch); }
+  if (name == "timeout_on_sleeping_server") { return t_timeout_on_sleeping_server(ch); }
+  if (name == "cancel_after_begin") { return t_cancel_after_begin(ch); }
+  if (name == "cancel_after_first_response") { return t_cancel_after_first_response(ch); }
+  if (name == "status_code_and_message") { return t_status_code_and_message(ch); }
+  if (name == "special_status_message") { return t_special_status_message(ch); }
+  if (name == "custom_metadata") { return t_custom_metadata(ch); }
+  if (name == "unimplemented_method") { return t_unimplemented_method(ch); }
+  if (name == "unimplemented_service") { return t_unimplemented_service(ch); }
+  if (name == "client_compressed_unary") { return t_client_compressed_unary(ch); }
+  if (name == "server_compressed_unary") { return t_server_compressed_unary(ch); }
+  if (name == "client_compressed_streaming") { return t_client_compressed_streaming(ch); }
+  if (name == "server_compressed_streaming") { return t_server_compressed_streaming(ch); }
+  return "unknown test case";
+}
+
+fn main(argc: int32, argv: cstring*) -> int32 {
+  var host: string = flag(argc, argv, "--server_host");
+  if (host.length == 0) { host = "127.0.0.1"; }
+  var port: int32 = parse_int(flag(argc, argv, "--server_port"));
+  var name: string = flag(argc, argv, "--test_case");
+  if (port < 0 || name.length == 0) {
+    println("usage: interop_client --server_host=H --server_port=N --test_case=NAME");
+    return 2;
+  }
+  if (flag(argc, argv, "--probe") == "false") { g_probe = false; }
+  g_zeros = (uint8*)calloc(BODY_MAX, 1);
+
+  var t: GrpcH2;
+  if (grpc_h2_dial(&t, host, port, 5000) != 0) {
+    println("FAIL {name}: cannot connect to {host}:{port}");
+    return 1;
+  }
+  var copts: GrpcChannelOptions;
+  copts.authority = "{host}:{port}";
+  if (str_starts_with(name, "client_compressed") != 0) { copts.send_enc = GRPC_ENC_GZIP; }
+  var ch: GrpcChannel;
+  grpc_channel_init(&ch, grpc_h2_transport(&t), &copts);
+
+  var why: string = run_case(name, &ch);
+
+  grpc_channel_close(&ch);
+  grpc_h2_free(&t);
+  if (why.length > 0) {
+    println("FAIL {name}: {why}");
+    return 1;
+  }
+  println("PASS {name}");
+  return 0;
+}

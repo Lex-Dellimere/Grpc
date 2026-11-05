@@ -1,0 +1,345 @@
+// gRPC interop test server: grpc.testing.TestService over plaintext h2c.
+//
+//   interop_server --port=N
+//
+// Behaviour follows doc/interop-test-descriptions.md of the gRPC repository.
+// One thread serves each connection.
+import "std/io";
+import "std/mem";
+import "std/core";
+import "std/socket";
+import "std/netaddr";
+import "std/thread";
+import "std/time_os";
+import "codec/core/list";
+import "grpc/grpc";
+import "gen/grpc/testing/test_grpc";
+
+// Largest payload a request may ask for. Every response body points into
+// one shared zero-filled block of this size.
+const MAX_PAYLOAD: int64 = 4194304;
+var g_zeros: uint8*;
+
+// One ResponseParameters, copied out of the request (HalfDuplexCall keeps
+// them until the client half-closes).
+struct RParam {
+  size: int32;
+  interval_us: int32;
+  compress: bool;
+}
+
+// What a streaming call remembers between messages. Lives in GrpcCall.user.
+struct CallState {
+  total: int64;                 // StreamingInputCall: payload bytes so far
+  bad_code: int32;              // StreamingInputCall: status to end with, 0 none
+  bad_msg: string;
+  echoed: bool;                 // metadata already echoed
+  params: CodecList<RParam>;    // HalfDuplexCall
+}
+
+fn state_of(c: GrpcCall*) -> CallState* {
+  if (c->user == 0) { c->user = (rawptr)new CallState; }
+  return (CallState*)c->user;
+}
+
+fn state_free(c: GrpcCall*) {
+  if (c->user == 0) { return; }
+  var s: CallState* = (CallState*)c->user;
+  codec_list_free(&s->params);
+  free(s);
+  c->user = (rawptr)0;
+}
+
+// Echo Metadata: x-grpc-test-echo-initial goes back as a response header,
+// x-grpc-test-echo-trailing-bin as a trailer. Call before the first send.
+fn echo_md(c: GrpcCall*) {
+  var req: GrpcMetadata* = grpc_call_headers_md(c);
+  var v: string;
+  if (grpc_md_get(req, "x-grpc-test-echo-initial", &v)) {
+    grpc_md_add(grpc_call_md(c), "x-grpc-test-echo-initial", v);
+  }
+  if (grpc_md_get(req, "x-grpc-test-echo-trailing-bin", &v)) {
+    grpc_md_add(grpc_call_trailer_md(c), "x-grpc-test-echo-trailing-bin", v);
+  }
+}
+
+// CompressedRequest: INVALID_ARGUMENT unless the message arrived compressed
+// exactly when the client said it would.
+fn check_expect(c: GrpcCall*, expect: GtBoolValue*) -> GrpcStatus {
+  if (expect != 0 && expect->value != c->recv_compressed) {
+    if (expect->value) { return grpc_status(GRPC_INVALID_ARGUMENT, "expected a compressed request"); }
+    return grpc_status(GRPC_INVALID_ARGUMENT, "expected an uncompressed request");
+  }
+  return grpc_status(GRPC_OK, "");
+}
+
+// Echo Status: the status a request asks for, or OK when it asks for none.
+fn wanted_status(es: GtEchoStatus*) -> GrpcStatus {
+  if (es != 0 && es->code != 0) { return grpc_status(es->code, es->message); }
+  return grpc_status(GRPC_OK, "");
+}
+
+fn size_ok(n: int32) -> bool {
+  return n >= 0 && (int64)n <= MAX_PAYLOAD;
+}
+
+fn payload_of(size: int32) -> GtPayload* {
+  var p: GtPayload* = new GtPayload;
+  p->body.chars = g_zeros;
+  p->body.length = (uint64)size;
+  return p;
+}
+
+// Sends one streaming response; compression applies to this message only.
+fn send_one(c: GrpcCall*, size: int32, compress: bool) {
+  grpc_srv_compress(c, compress);
+  var r: GtStreamingOutputCallResponse;
+  GtStreamingOutputCallResponse_init(&r);
+  r.payload = payload_of(size);
+  GtTestService_StreamingOutputCall_reply(c, &r);
+  GtStreamingOutputCallResponse_free(&r);
+}
+
+// Sends one response per parameter, sleeping interval_us before each.
+fn send_params(c: GrpcCall*, ps: CodecList<RParam>*) {
+  for i in 0..ps->len {
+    var p: RParam = ps->data[i];
+    if (p.interval_us > 0) { time_sleep_ns((int64)p.interval_us * 1000); }
+    send_one(c, p.size, p.compress);
+  }
+}
+
+fn params_ok(req: GtStreamingOutputCallRequest*) -> bool {
+  for i in 0..req->response_parameters.len {
+    if (!size_ok(req->response_parameters.data[i].size)) { return false; }
+  }
+  return true;
+}
+
+fn param_of(p: GtResponseParameters*) -> RParam {
+  var r: RParam;
+  r.size = p->size;
+  r.interval_us = p->interval_us;
+  r.compress = p->compressed != 0 && p->compressed->value;
+  return r;
+}
+
+// ---- unary ----
+
+fn empty_call(u: rawptr, c: GrpcCall*, req: GtEmpty*, resp: GtEmpty*) -> GrpcStatus {
+  return grpc_status(GRPC_OK, "");
+}
+
+fn unary_call(u: rawptr, c: GrpcCall*, req: GtSimpleRequest*, resp: GtSimpleResponse*) -> GrpcStatus {
+  echo_md(c);
+  var bad: GrpcStatus = check_expect(c, req->expect_compressed);
+  if (bad.code != GRPC_OK) { return bad; }
+  var want: GrpcStatus = wanted_status(req->response_status);
+  if (want.code != GRPC_OK) { return want; }
+  if (req->response_type != 0) { return grpc_status(GRPC_INVALID_ARGUMENT, "unsupported response type"); }
+  if (!size_ok(req->response_size)) { return grpc_status(GRPC_INVALID_ARGUMENT, "bad response size"); }
+  grpc_srv_compress(c, req->response_compressed != 0 && req->response_compressed->value);
+  resp->payload = payload_of(req->response_size);
+  return grpc_status(GRPC_OK, "");
+}
+
+// ---- server streaming ----
+
+fn streaming_output_call(u: rawptr, c: GrpcCall*, req: GtStreamingOutputCallRequest*) -> GrpcStatus {
+  echo_md(c);
+  var want: GrpcStatus = wanted_status(req->response_status);
+  if (want.code != GRPC_OK) { return want; }
+  if (!params_ok(req)) { return grpc_status(GRPC_INVALID_ARGUMENT, "bad response size"); }
+  var ps: CodecList<RParam>;
+  for i in 0..req->response_parameters.len {
+    codec_list_push(&ps, param_of(&req->response_parameters.data[i]));
+  }
+  send_params(c, &ps);
+  codec_list_free(&ps);
+  return grpc_status(GRPC_OK, "");
+}
+
+// ---- client streaming ----
+
+fn streaming_input_call(u: rawptr, c: GrpcCall*, req: GtStreamingInputCallRequest*) {
+  var s: CallState* = state_of(c);
+  if (s->bad_code == 0) {
+    var e: GrpcStatus = check_expect(c, req->expect_compressed);
+    if (e.code != GRPC_OK) {
+      s->bad_code = e.code;
+      s->bad_msg = e.message;
+    }
+  }
+  if (req->payload != 0) { s->total = s->total + (int64)req->payload->body.length; }
+}
+
+fn streaming_input_done(u: rawptr, c: GrpcCall*, resp: GtStreamingInputCallResponse*) -> GrpcStatus {
+  var s: CallState* = state_of(c);
+  var st: GrpcStatus = grpc_status(GRPC_OK, "");
+  if (s->bad_code != 0) {
+    st = grpc_status(s->bad_code, s->bad_msg);
+  } else {
+    resp->aggregated_payload_size = (int32)s->total;
+  }
+  state_free(c);
+  echo_md(c);
+  return st;
+}
+
+// ---- bidirectional ----
+
+fn full_duplex_call(u: rawptr, c: GrpcCall*, req: GtStreamingOutputCallRequest*) {
+  var s: CallState* = state_of(c);
+  if (!s->echoed) {
+    s->echoed = true;
+    echo_md(c);
+  }
+  var want: GrpcStatus = wanted_status(req->response_status);
+  if (want.code != GRPC_OK) {
+    state_free(c);
+    grpc_srv_finish(c, want);
+    return;
+  }
+  if (!params_ok(req)) {
+    state_free(c);
+    grpc_srv_finish(c, grpc_status(GRPC_INVALID_ARGUMENT, "bad response size"));
+    return;
+  }
+  var ps: CodecList<RParam>;
+  for i in 0..req->response_parameters.len {
+    codec_list_push(&ps, param_of(&req->response_parameters.data[i]));
+  }
+  send_params(c, &ps);
+  codec_list_free(&ps);
+}
+
+fn full_duplex_done(u: rawptr, c: GrpcCall*) -> GrpcStatus {
+  state_free(c);
+  return grpc_status(GRPC_OK, "");
+}
+
+// HalfDuplexCall: keep the parameters, answer after the client half-closes.
+fn half_duplex_call(u: rawptr, c: GrpcCall*, req: GtStreamingOutputCallRequest*) {
+  var s: CallState* = state_of(c);
+  for i in 0..req->response_parameters.len {
+    codec_list_push(&s->params, param_of(&req->response_parameters.data[i]));
+  }
+}
+
+fn half_duplex_done(u: rawptr, c: GrpcCall*) -> GrpcStatus {
+  var s: CallState* = state_of(c);
+  echo_md(c);
+  var st: GrpcStatus = grpc_status(GRPC_OK, "");
+  for i in 0..s->params.len {
+    if (!size_ok(s->params.data[i].size)) { st = grpc_status(GRPC_INVALID_ARGUMENT, "bad response size"); }
+  }
+  if (st.code == GRPC_OK) { send_params(c, &s->params); }
+  state_free(c);
+  return st;
+}
+
+fn on_cancel(u: rawptr, c: GrpcCall*) {
+  state_free(c);
+  grpc_srv_finish(c, grpc_status(GRPC_CANCELLED, ""));
+}
+
+// ---- connections ----
+
+struct Conn {
+  fd: int64;
+  t: GrpcH2;
+  sc: GrpcServerConn;
+}
+
+var g_srv: GrpcServer;
+var g_handlers: GtTestService_Handlers;
+
+fn serve_conn(arg: cstring) -> uint32 {
+  var cn: Conn* = (Conn*)arg;
+  grpc_h2_init(&cn->t, net_stream_socket(cn->fd), true, (H2cConfig*)0);
+  grpc_server_conn_init(&cn->sc, &g_srv, grpc_h2_transport(&cn->t));
+  grpc_server_conn_serve(&cn->sc);
+  grpc_server_conn_free(&cn->sc);
+  grpc_h2_free(&cn->t);
+  free(cn);
+  return 0;
+}
+
+fn parse_port(s: string) -> int32 {
+  var n: int32 = 0;
+  if (s.length == 0) { return -1; }
+  for i in 0..(int64)s.length {
+    var d: int32 = (int32)s.chars[i] - 48;
+    if (d < 0 || d > 9) { return -1; }
+    n = n * 10 + d;
+    if (n > 65535) { return -1; }
+  }
+  return n;
+}
+
+fn arg_str(c: cstring) -> string {
+  var s: string;
+  s.chars = (uint8*)c;
+  var n: int64 = 0;
+  while (s.chars[n] != 0) { n = n + 1; }
+  s.length = (uint64)n;
+  return s;
+}
+
+fn main(argc: int32, argv: cstring*) -> int32 {
+  var port: int32 = -1;
+  for i in 1..argc {
+    var a: string = arg_str(argv[i]);
+    if (a.length > 7 && a.chars[0] == 45 && a.chars[1] == 45 && a.chars[2] == 112 && a.chars[3] == 111 &&
+        a.chars[4] == 114 && a.chars[5] == 116 && a.chars[6] == 61) {
+      var v: string;
+      v.chars = a.chars + 7;
+      v.length = a.length - 7;
+      port = parse_port(v);
+    }
+  }
+  if (port < 0) {
+    println("usage: interop_server --port=N");
+    return 2;
+  }
+
+  g_zeros = (uint8*)calloc(MAX_PAYLOAD, 1);
+
+  g_handlers.on_cancel = &on_cancel;
+  g_handlers.EmptyCall = &empty_call;
+  g_handlers.UnaryCall = &unary_call;
+  g_handlers.StreamingOutputCall = &streaming_output_call;
+  g_handlers.StreamingInputCall = &streaming_input_call;
+  g_handlers.StreamingInputCall_done = &streaming_input_done;
+  g_handlers.FullDuplexCall = &full_duplex_call;
+  g_handlers.FullDuplexCall_done = &full_duplex_done;
+  g_handlers.HalfDuplexCall = &half_duplex_call;
+  g_handlers.HalfDuplexCall_done = &half_duplex_done;
+
+  var sopts: GrpcServerOptions;
+  sopts.send_enc = GRPC_ENC_GZIP;
+  grpc_server_init(&g_srv, &sopts);
+  GtTestService_register(&g_srv, &g_handlers);
+
+  var addr: NetAddr = net_addr_loopback(NET_IPV4, port);
+  var lfd: int64 = -1;
+  match (tcp_listen(&addr, 64)) {
+    case Ok(fd): { lfd = fd; }
+    case Err(e): {
+      println("cannot listen on port {port}");
+      return 1;
+    }
+  }
+  println("interop_server listening on 127.0.0.1:{port}");
+
+  while (true) {
+    var peer: NetAddr;
+    var fd: int64 = sock_accept(lfd, &peer);
+    if (fd < 0) { continue; }
+    var cn: Conn* = new Conn;
+    cn->fd = fd;
+    var tid: uint32 = 0;
+    CreateThread((cstring)0, (uint64)0, &serve_conn, (cstring)cn, (uint32)0, &tid);
+  }
+  return 0;
+}

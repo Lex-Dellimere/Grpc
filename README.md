@@ -97,6 +97,7 @@ the same machine:
 - [docs/api.md](docs/api.md): the library API
 - [docs/codegen.md](docs/codegen.md): what `grpc_gen` generates
 - [docs/references.md](docs/references.md): standards followed and what came from where
+- [docs/interop.md](docs/interop.md): interop results against grpc-go
 
 ## Tests
 

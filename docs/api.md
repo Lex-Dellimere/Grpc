@@ -87,6 +87,8 @@ event loop, so many calls can be open at once.
 | `grpc_channel_poll(ch)` | handle what is ready, for outside event loops |
 | `grpc_channel_close(ch)` | fails open calls with UNAVAILABLE |
 
+`GrpcCallOptions.md` is request metadata, copied when the call starts;
+it is how to send metadata with `grpc_unary` and the unary stubs.
 `GrpcCallOptions.compress` compresses requests with the channel's
 `send_enc`. Responses are decompressed whatever the server picks.
 

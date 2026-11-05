@@ -63,6 +63,6 @@ copied from any of them.
 
 The FileDescriptorProtos grpc_gen embeds for reflection were checked with
 Go's `protodesc.NewFiles` (google.golang.org/protobuf v1.36.11), which
-resolves every type reference. Interop against the grpc-go v1.80 interop
-client and server (doc/interop-test-descriptions.md) runs once the
-std/http2 transport is in.
+resolves every type reference. The interop cases of
+doc/interop-test-descriptions.md pass in both directions against grpc-go
+v1.80 (docs/interop.md). `mbuild bench` compares with grpc-go's benchmain.
