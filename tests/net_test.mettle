@@ -1,0 +1,165 @@
+// Over real sockets: a server thread and a client on loopback, through
+// std/h2conn. Large messages cross the HTTP/2 flow-control windows.
+import "grpc/grpc";
+import "tutil";
+import "std/mem";
+import "std/core";
+import "std/socket";
+import "std/netaddr";
+import "std/thread";
+
+var g_listen: int64 = -1;
+var g_srv: GrpcServer;
+
+fn echo_msg(u: rawptr, c: GrpcCall*, m: GrpcBytes*) {
+  if (c->kind == GRPC_SERVER_STREAMING) {
+    var n: int64 = m->len;
+    for i in 0..n * 100 {
+      var b: uint8[4];
+      for k in 0..4 { b[k] = (uint8)((i >> (int64)(k * 8)) & 255); }
+      var one: GrpcBytes;
+      one.data = &b[0];
+      one.len = 4;
+      grpc_srv_send(c, one);
+    }
+    return;
+  }
+  if (m->len == 4 && m->data[0] == 104) { return; }   // "hang": never answers
+  grpc_srv_send(c, *m);
+}
+
+fn echo_close(u: rawptr, c: GrpcCall*) {
+  if (c->ending) { return; }
+  // A unary that sent nothing is the "hang" request: leave it for the deadline.
+  if (c->kind == GRPC_UNARY && !c->sent_headers) { return; }
+  grpc_srv_finish(c, grpc_status(GRPC_OK, ""));
+}
+
+fn on_cancel(u: rawptr, c: GrpcCall*) {
+  grpc_srv_finish(c, grpc_status(GRPC_CANCELLED, ""));
+}
+
+fn server_main(arg: cstring) -> uint32 {
+  var peer: NetAddr;
+  var fd: int64 = sock_accept(g_listen, &peer);
+  if (fd < 0) { return 1; }
+  var t: GrpcH2;
+  grpc_h2_init(&t, net_stream_socket(fd), true, (H2cConfig*)0);
+  var sc: GrpcServerConn;
+  grpc_server_conn_init(&sc, &g_srv, grpc_h2_transport(&t));
+  grpc_server_conn_serve(&sc);
+  grpc_server_conn_free(&sc);
+  grpc_h2_free(&t);
+  return 0;
+}
+
+fn add(path: string, kind: int32) {
+  var d: GrpcMethodDesc;
+  d.path = path;
+  d.kind = kind;
+  d.on_message = &echo_msg;
+  d.on_half_close = &echo_close;
+  d.on_cancel = &on_cancel;
+  grpc_server_add(&g_srv, &d);
+}
+
+fn main() -> int32 {
+  var sopts: GrpcServerOptions;
+  sopts.max_recv = 8000000;
+  grpc_server_init(&g_srv, &sopts);
+  add("/t.E/Unary", GRPC_UNARY);
+  add("/t.E/Stream", GRPC_SERVER_STREAMING);
+  add("/t.E/Bidi", GRPC_BIDI_STREAMING);
+
+  var any: NetAddr = net_addr_loopback(NET_IPV4, 0);
+  match (tcp_listen(&any, 4)) {
+    case Ok(fd): { g_listen = fd; }
+    case Err(e): { return t_done("net: cannot listen"); }
+  }
+  var sa: NetAddr;
+  sock_local_addr(g_listen, &sa);
+  var tid: uint32 = 0;
+  var th: int64 = CreateThread((cstring)0, (uint64)0, &server_main, (cstring)0, (uint32)0, &tid);
+
+  var t: GrpcH2;
+  var fd: int64 = tcp_connect_addr(&sa, 2000);
+  t_ok("connect", fd >= 0);
+  grpc_h2_init(&t, net_stream_socket(fd), false, (H2cConfig*)0);
+  var copts: GrpcChannelOptions;
+  copts.max_recv = 8000000;
+  var ch: GrpcChannel;
+  grpc_channel_init(&ch, grpc_h2_transport(&t), &copts);
+  var o: GrpcCallOptions = grpc_call_options();
+  o.timeout_ns = 10000000000;
+
+  var out: GrpcBytes;
+  var st: GrpcStatus = grpc_unary(&ch, "/t.E/Unary", grpc_bytes("hello"), &out, &o);
+  t_eq("unary", st.code, GRPC_OK);
+  t_ok("unary body", out.len == 5 && out.data[0] == 104 && out.data[4] == 111);
+  if (out.data != 0) { free(out.data); }
+
+  // 3 MB each way: far past the 64 KiB windows.
+  var n: int64 = 3000000;
+  var big: uint8* = (uint8*)malloc(n);
+  for i in 0..n { big[i] = (uint8)((i * 31 + i / 1000) & 255); }
+  var bb: GrpcBytes;
+  bb.data = big;
+  bb.len = n;
+  st = grpc_unary(&ch, "/t.E/Unary", bb, &out, &o);
+  t_eq("big", st.code, GRPC_OK);
+  var same: bool = out.len == n;
+  if (same) { for i in 0..n { if (out.data[i] != big[i]) { same = false; break; } } }
+  t_ok("big same", same);
+  if (out.data != 0) { free(out.data); }
+
+  // Server streaming: 5000 small messages.
+  var c: GrpcCall* = grpc_call_start(&ch, "/t.E/Stream", GRPC_SERVER_STREAMING, &o);
+  grpc_call_send(c, grpc_bytes("abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwx"));
+  grpc_call_close_send(c);
+  var m: GrpcBytes;
+  var count: int64 = 0;
+  var order: bool = true;
+  while (grpc_call_recv(c, &m)) {
+    var v: int64 = 0;
+    for k in 0..4 { v = v | ((int64)m.data[k] << (int64)(k * 8)); }
+    if (v != count) { order = false; }
+    count = count + 1;
+  }
+  t_eq("stream count", count, 5000);
+  t_ok("stream order", order);
+  t_eq("stream ok", grpc_call_finish(c).code, GRPC_OK);
+  grpc_call_free(c);
+
+  // Bidi ping-pong.
+  c = grpc_call_start(&ch, "/t.E/Bidi", GRPC_BIDI_STREAMING, &o);
+  var pp: bool = true;
+  for i in 0..200 {
+    var w: string = "m{i}";
+    grpc_call_send(c, grpc_bytes(w));
+    if (!grpc_call_recv(c, &m) || grpc_bytes_str(m) != w) { pp = false; }
+  }
+  t_ok("bidi", pp);
+  t_eq("bidi ok", grpc_call_finish(c).code, GRPC_OK);
+  grpc_call_free(c);
+
+  // Deadline on a call the server never answers.
+  var dl: GrpcCallOptions = grpc_call_options();
+  dl.timeout_ns = 100000000;
+  st = grpc_unary(&ch, "/t.E/Unary", grpc_bytes("hang"), &out, &dl);
+  t_eq("deadline", st.code, GRPC_DEADLINE_EXCEEDED);
+
+  // Unknown method, and the connection still works afterwards.
+  st = grpc_unary(&ch, "/t.E/Nope", grpc_bytes("x"), &out, &o);
+  t_eq("unimplemented", st.code, GRPC_UNIMPLEMENTED);
+  st = grpc_unary(&ch, "/t.E/Unary", grpc_bytes("again"), &out, &o);
+  t_eq("after errors", st.code, GRPC_OK);
+  if (out.data != 0) { free(out.data); }
+
+  grpc_channel_close(&ch);
+  grpc_h2_free(&t);
+  thread_join_infinite(th);
+  sock_close(g_listen);
+  free(big);
+  grpc_server_free(&g_srv);
+  return t_done("net");
+}
