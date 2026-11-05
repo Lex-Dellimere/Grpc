@@ -1,0 +1,21 @@
+// mbuild.mettle: the project file for grpc. `mbuild help` lists its commands.
+//
+// Layout: src/grpc.mettle is the facade; modules sit in src/grpc/.
+// Tests: tests/<name>_test.mettle, run with `mbuild test` and `mbuild test -r`.
+import "mbuild/api";
+
+fn project() {
+  mb_package("grpc", "0.1.0");
+  mb_meta("description", "gRPC clients and servers in pure Mettle");
+  mb_meta("license", "Apache-2.0");
+  mb_meta("repository", "https://github.com/Lex-Dellimere/grpc");
+  mb_import_root("src");
+}
+
+fn deps() {
+  // Added as each part lands (see PLAN.md):
+  // mb_dep_path("http", "../http");
+  // mb_dep_path("codec", "../codec");
+  // mb_dep_path("press", "../press");
+  // mb_dep_path("mtls", "../mtls");
+}

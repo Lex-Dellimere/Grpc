@@ -1,0 +1,4 @@
+// grpc: gRPC clients and servers. See PLAN.md for the layout; the modules
+// land under src/grpc/ once the http package is ready.
+
+export const GRPC_VERSION = "0.1.0";
