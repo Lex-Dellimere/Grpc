@@ -5,7 +5,7 @@
 // levels, and no input can make the parser read past the end of the text.
 // Bytes outside the escapes are not checked for UTF-8.
 import "std/mem";
-import "std/arena";
+import "grpc/arena";
 
 export const GRPC_JSON_NULL = 0;
 export const GRPC_JSON_BOOL = 1;
@@ -29,7 +29,7 @@ export struct GrpcJson {
 const MAX_DEPTH: int32 = 64;
 
 struct JsonParser {
-  a: Arena*;
+  a: GrpcArena*;
   s: string;
   n: int64;
   pos: int64;
@@ -144,7 +144,7 @@ fn jp_string(p: JsonParser*, out: string*) -> bool {
     return jp_fail(p, "unterminated string");
   }
   // The result is never longer than the source text.
-  var buf: uint8* = (uint8*)arena_alloc(p->a, end - start + 1);
+  var buf: uint8* = (uint8*)grpc_arena_alloc(p->a, end - start + 1);
   var o: int64 = 0;
   i = start;
   while (i < end) {
@@ -312,18 +312,18 @@ fn jp_word(p: JsonParser*, w: string) -> bool {
   return true;
 }
 
-fn jp_grow_items(a: Arena*, buf: GrpcJson*, n: int64, cap: int64) -> GrpcJson* {
+fn jp_grow_items(a: GrpcArena*, buf: GrpcJson*, n: int64, cap: int64) -> GrpcJson* {
   var ncap: int64 = 4;
   if (cap > 0) { ncap = cap * 2; }
-  var nb: GrpcJson* = (GrpcJson*)arena_alloc_zeroed(a, ncap * sizeof(GrpcJson));
+  var nb: GrpcJson* = (GrpcJson*)grpc_arena_alloc_zeroed(a, ncap * sizeof(GrpcJson));
   if (n > 0) { memcpy(nb, buf, n * sizeof(GrpcJson)); }
   return nb;
 }
 
-fn jp_grow_keys(a: Arena*, buf: string*, n: int64, cap: int64) -> string* {
+fn jp_grow_keys(a: GrpcArena*, buf: string*, n: int64, cap: int64) -> string* {
   var ncap: int64 = 4;
   if (cap > 0) { ncap = cap * 2; }
-  var nb: string* = (string*)arena_alloc_zeroed(a, ncap * sizeof(string));
+  var nb: string* = (string*)grpc_arena_alloc_zeroed(a, ncap * sizeof(string));
   if (n > 0) { memcpy(nb, buf, n * sizeof(string)); }
   return nb;
 }
@@ -447,7 +447,7 @@ fn jp_value(p: JsonParser*, out: GrpcJson*, depth: int32) -> bool {
 // The error text, "json: <what> at byte <offset>", copied into the arena.
 fn jp_error(p: JsonParser*) -> string {
   var m: string = "json: {p->msg} at byte {p->at}";
-  var buf: uint8* = (uint8*)arena_alloc(p->a, (int64)m.length + 1);
+  var buf: uint8* = (uint8*)grpc_arena_alloc(p->a, (int64)m.length + 1);
   memcpy(buf, m.chars, (int64)m.length);
   var r: string;
   r.chars = buf;
@@ -458,13 +458,13 @@ fn jp_error(p: JsonParser*) -> string {
 
 // Parses text into a tree allocated from a. Returns "" and sets *out on
 // success; otherwise returns the error and sets *out to 0.
-export fn grpc_json_parse(a: Arena*, text: string, out: GrpcJson**) -> string {
+export fn grpc_json_parse(a: GrpcArena*, text: string, out: GrpcJson**) -> string {
   *out = (GrpcJson*)0;
   var p: JsonParser;
   p.a = a;
   p.s = text;
   p.n = (int64)text.length;
-  var root: GrpcJson* = (GrpcJson*)arena_alloc_zeroed(a, sizeof(GrpcJson));
+  var root: GrpcJson* = (GrpcJson*)grpc_arena_alloc_zeroed(a, sizeof(GrpcJson));
   if (!jp_value(&p, root, 0)) { return jp_error(&p); }
   jp_skip_ws(&p);
   if (p.pos != p.n) {

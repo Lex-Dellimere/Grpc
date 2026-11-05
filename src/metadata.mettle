@@ -6,7 +6,7 @@
 // Other values are printable ASCII (0x20..0x7E). Every string added is
 // copied into the arena the list was made with.
 import "std/mem";
-import "std/arena";
+import "grpc/arena";
 import "std/hpack";
 
 export const GRPC_MD_OK = 0;
@@ -24,10 +24,10 @@ export struct GrpcMetadata {
   items: GrpcMdEntry*;
   count: int64;
   cap: int64;
-  arena: Arena*;
+  arena: GrpcArena*;
 }
 
-export fn grpc_md_init(md: GrpcMetadata*, arena: Arena*) {
+export fn grpc_md_init(md: GrpcMetadata*, arena: GrpcArena*) {
   md->items = (GrpcMdEntry*)0;
   md->count = 0;
   md->cap = 0;
@@ -105,10 +105,10 @@ export fn grpc_md_is_reserved(key: string) -> bool {
     eq_nocase(key, "upgrade") || eq_nocase(key, "host");
 }
 
-fn copy_in(a: Arena*, s: string, lowercase: bool) -> string {
+fn copy_in(a: GrpcArena*, s: string, lowercase: bool) -> string {
   var r: string;
   if (s.length == 0) { return r; }
-  var p: uint8* = (uint8*)arena_alloc(a, (int64)s.length);
+  var p: uint8* = (uint8*)grpc_arena_alloc(a, (int64)s.length);
   for i in 0..(int64)s.length {
     if (lowercase) { p[i] = lower(s.chars[i]); } else { p[i] = s.chars[i]; }
   }
@@ -121,7 +121,7 @@ fn push(md: GrpcMetadata*, key: string, value: string) {
   if (md->count == md->cap) {
     var ncap: int64 = md->cap * 2;
     if (ncap < 8) { ncap = 8; }
-    var n: GrpcMdEntry* = (GrpcMdEntry*)arena_alloc(md->arena, ncap * sizeof(GrpcMdEntry));
+    var n: GrpcMdEntry* = (GrpcMdEntry*)grpc_arena_alloc(md->arena, ncap * sizeof(GrpcMdEntry));
     for i in 0..md->count { n[i] = md->items[i]; }
     md->items = n;
     md->cap = ncap;
@@ -291,10 +291,10 @@ export struct GrpcHeaderList {
   items: HpackHeader*;
   count: int64;
   cap: int64;
-  arena: Arena*;
+  arena: GrpcArena*;
 }
 
-export fn grpc_hl_init(h: GrpcHeaderList*, arena: Arena*) {
+export fn grpc_hl_init(h: GrpcHeaderList*, arena: GrpcArena*) {
   h->items = (HpackHeader*)0;
   h->count = 0;
   h->cap = 0;
@@ -306,7 +306,7 @@ export fn grpc_hl_add(h: GrpcHeaderList*, name: string, value: string) {
   if (h->count == h->cap) {
     var ncap: int64 = h->cap * 2;
     if (ncap < 16) { ncap = 16; }
-    var n: HpackHeader* = (HpackHeader*)arena_alloc(h->arena, ncap * sizeof(HpackHeader));
+    var n: HpackHeader* = (HpackHeader*)grpc_arena_alloc(h->arena, ncap * sizeof(HpackHeader));
     for i in 0..h->count { n[i] = h->items[i]; }
     h->items = n;
     h->cap = ncap;
@@ -327,7 +327,7 @@ export fn grpc_md_to_headers(md: GrpcMetadata*, h: GrpcHeaderList*) {
       var n: int64 = grpc_b64_len((int64)e.value.length);
       var v: string;
       if (n > 0) {
-        var p: uint8* = (uint8*)arena_alloc(h->arena, n);
+        var p: uint8* = (uint8*)grpc_arena_alloc(h->arena, n);
         grpc_b64_encode(e.value.chars, (int64)e.value.length, p);
         v.chars = p;
         v.length = (uint64)n;
@@ -364,7 +364,7 @@ export fn grpc_md_add_wire(md: GrpcMetadata*, name: string, value: string) -> in
       while (b > a && value.chars[b - 1] == 32) { b = b - 1; }
       var raw: string;
       if (b > a) {
-        var p: uint8* = (uint8*)arena_alloc(md->arena, (b - a) / 4 * 3 + 3);
+        var p: uint8* = (uint8*)grpc_arena_alloc(md->arena, (b - a) / 4 * 3 + 3);
         var got: int64 = grpc_b64_decode(value.chars + a, b - a, p);
         if (got < 0) { return GRPC_MD_E_BASE64; }
         raw.chars = p;

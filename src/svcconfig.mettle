@@ -5,7 +5,7 @@
 // rules are gRFC A6. Parsing is strict: a field of the wrong type or a
 // value out of range rejects the whole config. Unknown keys are ignored.
 import "std/mem";
-import "std/arena";
+import "grpc/arena";
 import "grpc/json";
 import "grpc/status";
 
@@ -386,7 +386,7 @@ fn sc_name_seen(ms: GrpcMethodConfig*, n: int64, service: string, meth: string) 
 
 // Reads methodConfig object o into ms[idx]. Its names must not repeat any
 // name of the configs before it (ms[0..idx)).
-fn sc_method(a: Arena*, o: GrpcJson*, ms: GrpcMethodConfig*, idx: int64) -> string {
+fn sc_method(a: GrpcArena*, o: GrpcJson*, ms: GrpcMethodConfig*, idx: int64) -> string {
   var m: GrpcMethodConfig* = &ms[idx];
   if (o->kind != GRPC_JSON_OBJECT) { return "must be an object"; }
   m->wait_for_ready = -1;
@@ -395,7 +395,7 @@ fn sc_method(a: Arena*, o: GrpcJson*, ms: GrpcMethodConfig*, idx: int64) -> stri
   if (names == 0 || names->kind != GRPC_JSON_ARRAY || names->count == 0) {
     return "name must be a non-empty array";
   }
-  m->names = (GrpcMethodName*)arena_alloc_zeroed(a, names->count * sizeof(GrpcMethodName));
+  m->names = (GrpcMethodName*)grpc_arena_alloc_zeroed(a, names->count * sizeof(GrpcMethodName));
   m->nnames = names->count;
   for i in 0..names->count {
     var e: GrpcJson* = &names->items[i];
@@ -453,8 +453,8 @@ fn sc_method(a: Arena*, o: GrpcJson*, ms: GrpcMethodConfig*, idx: int64) -> stri
 }
 
 // Copies s into the arena.
-fn sc_copy(a: Arena*, s: string) -> string {
-  var p: uint8* = (uint8*)arena_alloc(a, (int64)s.length + 1);
+fn sc_copy(a: GrpcArena*, s: string) -> string {
+  var p: uint8* = (uint8*)grpc_arena_alloc(a, (int64)s.length + 1);
   if (s.length > 0) { memcpy(p, s.chars, (int64)s.length); }
   var r: string;
   r.chars = p;
@@ -463,14 +463,14 @@ fn sc_copy(a: Arena*, s: string) -> string {
 }
 
 // "<where>: <what>" in the arena.
-fn sc_error_at(a: Arena*, where_: string, what: string) -> string {
+fn sc_error_at(a: GrpcArena*, where_: string, what: string) -> string {
   var m: string = "{where_}: {what}";
   var r: string = sc_copy(a, m);
   free(m.chars);
   return r;
 }
 
-fn sc_lower(a: Arena*, s: string) -> string {
+fn sc_lower(a: GrpcArena*, s: string) -> string {
   var r: string = sc_copy(a, s);
   for i in 0..(int64)r.length {
     if (r.chars[i] >= 65 && r.chars[i] <= 90) { r.chars[i] = r.chars[i] + 32; }
@@ -500,7 +500,7 @@ fn sc_throttle(o: GrpcJson*, out: GrpcServiceConfig*) -> string {
 }
 
 // "loadBalancingConfig" or the legacy "loadBalancingPolicy" into lb_policy.
-fn sc_lb(a: Arena*, o: GrpcJson*, out: GrpcServiceConfig*) -> string {
+fn sc_lb(a: GrpcArena*, o: GrpcJson*, out: GrpcServiceConfig*) -> string {
   var lbc: GrpcJson* = grpc_json_get(o, "loadBalancingConfig");
   if (lbc != 0) {
     if (lbc->kind != GRPC_JSON_ARRAY || lbc->count == 0) {
@@ -527,7 +527,7 @@ fn sc_lb(a: Arena*, o: GrpcJson*, out: GrpcServiceConfig*) -> string {
 
 // Parses a service config document into *out (allocated from a). Returns
 // "" on success, otherwise a message saying what is wrong.
-export fn grpc_svc_config_parse(a: Arena*, json: string, out: GrpcServiceConfig*) -> string {
+export fn grpc_svc_config_parse(a: GrpcArena*, json: string, out: GrpcServiceConfig*) -> string {
   var zero: GrpcServiceConfig;
   *out = zero;
   out->lb_policy = "pick_first";
@@ -549,7 +549,7 @@ export fn grpc_svc_config_parse(a: Arena*, json: string, out: GrpcServiceConfig*
   if (mc != 0) {
     if (mc->kind != GRPC_JSON_ARRAY) { return "methodConfig must be an array"; }
     if (mc->count > 0) {
-      out->methods = (GrpcMethodConfig*)arena_alloc_zeroed(a, mc->count * sizeof(GrpcMethodConfig));
+      out->methods = (GrpcMethodConfig*)grpc_arena_alloc_zeroed(a, mc->count * sizeof(GrpcMethodConfig));
       out->nmethods = mc->count;
     }
     for i in 0..mc->count {

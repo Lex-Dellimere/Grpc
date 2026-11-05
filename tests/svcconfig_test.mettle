@@ -5,11 +5,11 @@ import "grpc/svcconfig";
 import "grpc/status";
 import "grpc/json";
 import "tutil";
-import "std/arena";
+import "grpc/arena";
 
 // Turns every ' into ".
-fn q(a: Arena*, s: string) -> string {
-  var p: uint8* = (uint8*)arena_alloc(a, (int64)s.length + 1);
+fn q(a: GrpcArena*, s: string) -> string {
+  var p: uint8* = (uint8*)grpc_arena_alloc(a, (int64)s.length + 1);
   for i in 0..(int64)s.length {
     var c: uint8 = s.chars[i];
     if (c == 39) { c = 34; }
@@ -21,27 +21,27 @@ fn q(a: Arena*, s: string) -> string {
   return r;
 }
 
-fn parse(a: Arena*, text: string, c: GrpcServiceConfig*) -> string {
+fn parse(a: GrpcArena*, text: string, c: GrpcServiceConfig*) -> string {
   return grpc_svc_config_parse(a, q(a, text), c);
 }
 
 // A config with one method, wrapped around the given methodConfig body.
-fn one(a: Arena*, body: string) -> string {
+fn one(a: GrpcArena*, body: string) -> string {
   var c: GrpcServiceConfig;
   return parse(a, "{{'methodConfig': [{{'name': [{{'service': 's'}], " + body + "}]}", &c);
 }
 
-fn rejects(a: Arena*, name: string, text: string) {
+fn rejects(a: GrpcArena*, name: string, text: string) {
   var c: GrpcServiceConfig;
   var e: string = parse(a, text, &c);
   t_ok(name, e != "");
 }
 
-fn rejects_one(a: Arena*, name: string, body: string) {
+fn rejects_one(a: GrpcArena*, name: string, body: string) {
   t_ok(name, one(a, body) != "");
 }
 
-fn accepts_one(a: Arena*, name: string, body: string) {
+fn accepts_one(a: GrpcArena*, name: string, body: string) {
   var e: string = one(a, body);
   t_str(name, e, "");
 }
@@ -63,7 +63,7 @@ fn mask(c0: int32, c1: int32, c2: int32) -> uint32 {
 const FULL: string = "{{ 'methodConfig': [ {{ 'name': [{{'service': 'pkg.Echo', 'method': 'Say'}], 'waitForReady': true, 'timeout': '1.5s', 'maxRequestMessageBytes': 1024, 'maxResponseMessageBytes': '2048', 'retryPolicy': {{ 'maxAttempts': 4, 'initialBackoff': '0.1s', 'maxBackoff': '1s', 'backoffMultiplier': 2, 'retryableStatusCodes': ['UNAVAILABLE', 'aborted', 4] } }, {{ 'name': [{{'service': 'pkg.Echo'}], 'timeout': '10s', 'hedgingPolicy': {{ 'maxAttempts': 9, 'hedgingDelay': '0.2s', 'nonFatalStatusCodes': ['UNAVAILABLE', 'INTERNAL'] } }, {{ 'name': [{{}], 'timeout': '30s', 'futureKey': [1, 2, {{'x': null}], 'waitForReady': false }, {{ 'name': [{{'service': 'other.Svc', 'method': ''}, {{'service': 'x.Y', 'method': 'Z'}], 'retryPolicy': {{ 'maxAttempts': 2, 'initialBackoff': '1s', 'maxBackoff': '2s', 'backoffMultiplier': 1.5, 'retryableStatusCodes': [0] } } ], 'retryThrottling': {{'maxTokens': 10, 'tokenRatio': 0.1}, 'loadBalancingConfig': [{{'round_robin': {{}}, {{'pick_first': {{}}], 'somethingNew': {{'a': [true]} }";
 
 fn main() -> int32 {
-  var a: Arena* = arena_init(0);
+  var a: GrpcArena* = grpc_arena_new();
   var c: GrpcServiceConfig;
 
   // ---- a full config ----
@@ -434,6 +434,6 @@ fn main() -> int32 {
   t_eq("pushback exponent", grpc_pushback_parse("1e3"), -1);
   t_eq("pushback hex", grpc_pushback_parse("0x10"), -1);
 
-  arena_free(a);
+  grpc_arena_free(a);
   return t_done("svcconfig");
 }

@@ -1,6 +1,7 @@
 // grpc: gRPC clients and servers in pure Mettle. Importing this file brings
 // in every part; import a single module (such as "grpc/status") to keep
 // the build small.
+import "grpc/arena";
 import "grpc/status";
 import "grpc/metadata";
 import "grpc/deadline";

@@ -4,7 +4,7 @@
 // into protobuf types. A call owns an arena that lives as long as it does;
 // metadata, the status message and other strings of the call live there.
 import "std/mem";
-import "std/arena";
+import "grpc/arena";
 import "press/core/buf";
 import "press/core/status";
 import "grpc/status";
@@ -76,7 +76,7 @@ export struct GrpcAttempt {
 export const GRPC_MAX_ATTEMPTS = 8;
 
 export struct GrpcCall {
-  arena: Arena*;
+  arena: GrpcArena*;
   is_server: bool;
   kind: int32;
   path: string;
@@ -142,7 +142,7 @@ export struct GrpcCall {
 // A fresh call with its own arena.
 export fn grpc_call_alloc(is_server: bool) -> GrpcCall* {
   var c: GrpcCall* = new GrpcCall;
-  c->arena = arena_init(0);
+  c->arena = grpc_arena_new();
   c->is_server = is_server;
   c->committed = -1;
   grpc_md_init(&c->send_md, c->arena);
@@ -160,7 +160,7 @@ export fn grpc_call_release(c: GrpcCall*) {
   press_buf_free(&c->inbox);
   press_buf_free(&c->sendlog);
   press_buf_free(&c->out);
-  arena_free(c->arena);
+  grpc_arena_free(c->arena);
   free(c);
 }
 
@@ -168,7 +168,7 @@ export fn grpc_call_release(c: GrpcCall*) {
 export fn grpc_call_keep(c: GrpcCall*, s: string) -> string {
   var r: string;
   if (s.length == 0) { return r; }
-  var p: uint8* = (uint8*)arena_alloc(c->arena, (int64)s.length);
+  var p: uint8* = (uint8*)grpc_arena_alloc(c->arena, (int64)s.length);
   memcpy(p, s.chars, (int64)s.length);
   r.chars = p;
   r.length = s.length;

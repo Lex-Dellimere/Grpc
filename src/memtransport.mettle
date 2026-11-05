@@ -6,7 +6,7 @@
 // poll finds nothing queued it calls the hook once, which should let the
 // other side make progress (for a server end, grpc_server_conn_step).
 import "std/mem";
-import "std/arena";
+import "grpc/arena";
 import "std/hpack";
 import "std/time";
 import "grpc/transport";
@@ -18,7 +18,7 @@ export struct GrpcMemEnd {
   qlen: int64;
   qhead: int64;
   qcap: int64;
-  arena: Arena*;          // event payloads; reset when the queue drains
+  arena: GrpcArena*;          // event payloads; reset when the queue drains
   idle: fn(rawptr) -> void;
   idle_user: rawptr;
   in_idle: bool;
@@ -57,7 +57,7 @@ fn push(e: GrpcMemEnd*, ev: GrpcTEvent*) {
 
 fn copy_headers(e: GrpcMemEnd*, hs: HpackHeader*, n: int64) -> HpackHeader* {
   if (n <= 0) { return (HpackHeader*)0; }
-  var out: HpackHeader* = (HpackHeader*)arena_alloc(e->arena, n * sizeof(HpackHeader));
+  var out: HpackHeader* = (HpackHeader*)grpc_arena_alloc(e->arena, n * sizeof(HpackHeader));
   for i in 0..n {
     var h: HpackHeader;
     h.name = copy_bytes(e, hs[i].name);
@@ -70,7 +70,7 @@ fn copy_headers(e: GrpcMemEnd*, hs: HpackHeader*, n: int64) -> HpackHeader* {
 fn copy_bytes(e: GrpcMemEnd*, s: string) -> string {
   var r: string;
   if (s.length == 0) { return r; }
-  var p: uint8* = (uint8*)arena_alloc(e->arena, (int64)s.length);
+  var p: uint8* = (uint8*)grpc_arena_alloc(e->arena, (int64)s.length);
   memcpy(p, s.chars, (int64)s.length);
   r.chars = p;
   r.length = s.length;
@@ -119,7 +119,7 @@ fn m_send_data(u: rawptr, stream: int64, p: uint8*, n: int64, end: bool) -> int6
   ev.stream = stream;
   ev.end_stream = end;
   if (n > 0) {
-    var d: uint8* = (uint8*)arena_alloc(to->arena, n);
+    var d: uint8* = (uint8*)grpc_arena_alloc(to->arena, n);
     memcpy(d, p, n);
     ev.data = d;
   }
@@ -183,7 +183,7 @@ fn m_poll(u: rawptr, ev: GrpcTEvent*, timeout_ns: int64) -> int32 {
   if (e->qhead == e->qlen) {
     e->qhead = 0;
     e->qlen = 0;
-    arena_reset(e->arena);
+    grpc_arena_reset(e->arena);
     if (e->idle != 0 && !e->in_idle) {
       e->in_idle = true;
       e->idle(e->idle_user);
@@ -205,7 +205,7 @@ fn m_poll(u: rawptr, ev: GrpcTEvent*, timeout_ns: int64) -> int32 {
 fn end_init(e: GrpcMemEnd*, p: GrpcMemPipe*, is_server: bool) {
   e->pipe = p;
   e->is_server = is_server;
-  e->arena = arena_init(0);
+  e->arena = grpc_arena_new();
 }
 
 export fn grpc_mem_pipe_init(p: GrpcMemPipe*) {
@@ -216,8 +216,8 @@ export fn grpc_mem_pipe_init(p: GrpcMemPipe*) {
 }
 
 export fn grpc_mem_pipe_free(p: GrpcMemPipe*) {
-  arena_free(p->client.arena);
-  arena_free(p->server.arena);
+  grpc_arena_free(p->client.arena);
+  grpc_arena_free(p->server.arena);
   if (p->client.q != 0) { free(p->client.q); }
   if (p->server.q != 0) { free(p->server.q); }
 }

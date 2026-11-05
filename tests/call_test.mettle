@@ -4,7 +4,7 @@
 import "grpc/grpc";
 import "tutil";
 import "std/mem";
-import "std/arena";
+import "grpc/arena";
 
 var g_fail_count: int32 = 0;
 var g_prev_attempts: int32 = 0;
@@ -151,7 +151,7 @@ fn add(s: GrpcServer*, path: string, kind: int32, on_msg: fn(rawptr, GrpcCall*, 
 fn finish_ok(c: GrpcCall*) { grpc_srv_finish(c, grpc_status(GRPC_OK, "")); }
 
 fn main() -> int32 {
-  var a: Arena* = arena_init(0);
+  var a: GrpcArena* = grpc_arena_new();
   var sc_json: string = "{{\"methodConfig\": [" +
     "{{\"name\": [{{\"service\": \"test.Echo\", \"method\": \"Unary\"}], \"retryPolicy\": {{\"maxAttempts\": 4, \"initialBackoff\": \"0.001s\", \"maxBackoff\": \"0.005s\", \"backoffMultiplier\": 2, \"retryableStatusCodes\": [\"UNAVAILABLE\"]}}," +
     "{{\"name\": [{{\"service\": \"test.Echo\", \"method\": \"Hedge\"}], \"hedgingPolicy\": {{\"maxAttempts\": 3, \"hedgingDelay\": \"0.002s\"}}" +
@@ -379,6 +379,6 @@ fn main() -> int32 {
   grpc_mem_pipe_free(&pipe);
   grpc_server_free(&srv);
   free(bigs);
-  arena_free(a);
+  grpc_arena_free(a);
   return t_done("call");
 }

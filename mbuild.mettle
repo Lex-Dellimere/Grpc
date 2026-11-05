@@ -14,6 +14,7 @@ fn project() {
   mb_bin("example_greeter", "examples/greeter/main.mettle");
   mb_bin("interop_server", "tools/interop/server.mettle");
   mb_bin("interop_client", "tools/interop/client.mettle");
+  mb_bin("grpc_bench", "bench/bench.mettle");
 }
 
 fn deps() {
@@ -38,4 +39,11 @@ fn cmd_gen(a: MbArgs*) -> int32 {
   if (mb_sh(gen + " -I examples/greeter --out examples/greeter/gen helloworld.proto") != 0) { return 1; }
   if (mb_sh(gen + " -I tools/interop/proto --out tools/interop/gen --prefix Gt grpc/testing/test.proto") != 0) { return 1; }
   return mb_sh(gen + " -I tests/proto -I proto --out tests/gen --prefix T echo.proto");
+}
+
+// bench: builds the loopback benchmark in release and runs it.
+fn cmd_bench(a: MbArgs*) -> int32 {
+  if (mb_mbuild("build -r grpc_bench") != 0) { return 1; }
+  var c: MbCmd* = mb_cmd(mb_out("grpc_bench", mb_os(), "release"));
+  return mb_cmd_run(c);
 }

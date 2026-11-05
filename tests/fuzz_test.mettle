@@ -3,7 +3,7 @@
 import "grpc/grpc";
 import "tutil";
 import "std/mem";
-import "std/arena";
+import "grpc/arena";
 import "std/hpack";
 
 const NAMES: string[16] = [
@@ -18,10 +18,10 @@ const VALUES: string[12] = [
 
 var g_rand_bytes: uint8[512];
 
-fn rand_value(a: Arena*) -> string {
+fn rand_value(a: GrpcArena*) -> string {
   if (t_rand() % 2 == 0) { return VALUES[t_rand() % 12]; }
   var n: int64 = (int64)(t_rand() % 40);
-  var p: uint8* = (uint8*)arena_alloc(a, n + 1);
+  var p: uint8* = (uint8*)grpc_arena_alloc(a, n + 1);
   for i in 0..n { p[i] = (uint8)(t_rand() & 255); }
   var s: string;
   s.chars = p;
@@ -29,7 +29,7 @@ fn rand_value(a: Arena*) -> string {
   return s;
 }
 
-fn rand_headers(a: Arena*, hs: HpackHeader*, max: int64) -> int64 {
+fn rand_headers(a: GrpcArena*, hs: HpackHeader*, max: int64) -> int64 {
   var n: int64 = (int64)(t_rand() % (uint64)max);
   for i in 0..n {
     var h: HpackHeader;
@@ -60,7 +60,7 @@ fn any_cancel(u: rawptr, c: GrpcCall*) {
 // Client side: the idle hook plays a broken server.
 struct Bad {
   t: GrpcTransport;
-  a: Arena*;
+  a: GrpcArena*;
   steps: int32;
 }
 
@@ -97,7 +97,7 @@ fn bad_server(u: rawptr) {
 
 fn main() -> int32 {
   t_seed(1234);
-  var a: Arena* = arena_init(0);
+  var a: GrpcArena* = grpc_arena_new();
   var hs: HpackHeader[16];
   for round in 0..20000 {
     var n: int64 = rand_headers(a, &hs[0], 16);
@@ -107,7 +107,7 @@ fn main() -> int32 {
     grpc_request_parse(&hs[0], n, &md, &ri);
     var si: GrpcResponseInfo;
     grpc_response_parse(a, &hs[0], n, &md, &si);
-    if (round % 1000 == 0) { arena_reset(a); }
+    if (round % 1000 == 0) { grpc_arena_reset(a); }
   }
   t_ok("header parsers survived", true);
 
@@ -172,7 +172,7 @@ fn main() -> int32 {
     }
     grpc_server_conn_free(&sc);
     grpc_mem_pipe_free(&pipe);
-    arena_reset(a);
+    grpc_arena_reset(a);
   }
   t_ok("server survived", g_server_msgs >= 0);
 
@@ -199,9 +199,9 @@ fn main() -> int32 {
     grpc_call_free(c);
     grpc_channel_close(&ch);
     grpc_mem_pipe_free(&pipe2);
-    arena_reset(a);
+    grpc_arena_reset(a);
   }
   grpc_server_free(&srv);
-  arena_free(a);
+  grpc_arena_free(a);
   return t_done("fuzz");
 }

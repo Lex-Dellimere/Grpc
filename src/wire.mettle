@@ -1,6 +1,6 @@
 // The HTTP/2 headers of a gRPC call (doc/PROTOCOL-HTTP2.md): what a client
 // sends, what a server answers, and the trailers that carry the status.
-import "std/arena";
+import "grpc/arena";
 import "std/hpack";
 import "grpc/status";
 import "grpc/metadata";
@@ -32,10 +32,10 @@ export fn grpc_content_type_ok(v: string) -> bool {
   return c == 43 || c == 59;
 }
 
-fn copy_str(a: Arena*, p: uint8*, n: int64) -> string {
+fn copy_str(a: GrpcArena*, p: uint8*, n: int64) -> string {
   var r: string;
   if (n <= 0) { return r; }
-  var d: uint8* = (uint8*)arena_alloc(a, n);
+  var d: uint8* = (uint8*)grpc_arena_alloc(a, n);
   for i in 0..n { d[i] = p[i]; }
   r.chars = d;
   r.length = (uint64)n;
@@ -197,7 +197,7 @@ export fn grpc_trailers(st: GrpcStatus*, md: GrpcMetadata*, trailers_only: bool,
   }
   if (st->details.length > 0) {
     var n: int64 = grpc_b64_len((int64)st->details.length);
-    var p: uint8* = (uint8*)arena_alloc(out->arena, n);
+    var p: uint8* = (uint8*)grpc_arena_alloc(out->arena, n);
     grpc_b64_encode(st->details.chars, (int64)st->details.length, p);
     var v: string;
     v.chars = p;
@@ -230,7 +230,7 @@ export struct GrpcResponseInfo {
 }
 
 // Reads a HEADERS block from the server. md gets custom metadata.
-export fn grpc_response_parse(a: Arena*, hs: HpackHeader*, n: int64, md: GrpcMetadata*, info: GrpcResponseInfo*) {
+export fn grpc_response_parse(a: GrpcArena*, hs: HpackHeader*, n: int64, md: GrpcMetadata*, info: GrpcResponseInfo*) {
   for i in 0..n {
     var name: string = hs[i].name;
     var v: string = hs[i].value;
@@ -253,7 +253,7 @@ export fn grpc_response_parse(a: Arena*, hs: HpackHeader*, n: int64, md: GrpcMet
     }
     if (name == "grpc-message") { info->message = grpc_message_decode_in(a, v); continue; }
     if (name == "grpc-status-details-bin") {
-      var p: uint8* = (uint8*)arena_alloc(a, (int64)v.length + 3);
+      var p: uint8* = (uint8*)grpc_arena_alloc(a, (int64)v.length + 3);
       var got: int64 = grpc_b64_decode(v.chars, (int64)v.length, p);
       if (got >= 0) {
         info->details.chars = p;

@@ -3,18 +3,18 @@ import "grpc/metadata";
 import "grpc/deadline";
 import "grpc/status";
 import "tutil";
-import "std/arena";
+import "grpc/arena";
 
-fn b64(a: Arena*, s: string) -> string {
-  var p: uint8* = (uint8*)arena_alloc(a, grpc_b64_len((int64)s.length) + 1);
+fn b64(a: GrpcArena*, s: string) -> string {
+  var p: uint8* = (uint8*)grpc_arena_alloc(a, grpc_b64_len((int64)s.length) + 1);
   var r: string;
   r.chars = p;
   r.length = (uint64)grpc_b64_encode(s.chars, (int64)s.length, p);
   return r;
 }
 
-fn unb64(a: Arena*, s: string) -> string {
-  var p: uint8* = (uint8*)arena_alloc(a, (int64)s.length + 3);
+fn unb64(a: GrpcArena*, s: string) -> string {
+  var p: uint8* = (uint8*)grpc_arena_alloc(a, (int64)s.length + 3);
   var r: string;
   var n: int64 = grpc_b64_decode(s.chars, (int64)s.length, p);
   if (n < 0) { return "ERR"; }
@@ -32,7 +32,7 @@ fn timeout(ns: int64) -> string {
 }
 
 fn main() -> int32 {
-  var a: Arena* = arena_init(0);
+  var a: GrpcArena* = grpc_arena_new();
   // RFC 4648 test vectors, unpadded.
   t_str("b64 f", b64(a, "f"), "Zg");
   t_str("b64 fo", b64(a, "fo"), "Zm8");
@@ -118,6 +118,6 @@ fn main() -> int32 {
   t_eq("past deadline", grpc_ctx_err(&late), GRPC_DEADLINE_EXCEEDED);
   t_eq("min", grpc_deadline_min(0, 5), 5);
   t_eq("min2", grpc_deadline_min(9, 5), 5);
-  arena_free(a);
+  grpc_arena_free(a);
   return t_done("metadata");
 }

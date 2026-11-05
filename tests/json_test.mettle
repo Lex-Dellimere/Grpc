@@ -1,11 +1,11 @@
 // The JSON parser: every value kind, escapes, numbers, errors, depth, fuzzing.
 import "grpc/json";
 import "tutil";
-import "std/arena";
+import "grpc/arena";
 
 // A string of the first n of these bytes.
-fn bs(a: Arena*, n: int64, b0: int32, b1: int32, b2: int32, b3: int32) -> string {
-  var p: uint8* = (uint8*)arena_alloc(a, 5);
+fn bs(a: GrpcArena*, n: int64, b0: int32, b1: int32, b2: int32, b3: int32) -> string {
+  var p: uint8* = (uint8*)grpc_arena_alloc(a, 5);
   p[0] = (uint8)b0;
   p[1] = (uint8)b1;
   p[2] = (uint8)b2;
@@ -16,7 +16,7 @@ fn bs(a: Arena*, n: int64, b0: int32, b1: int32, b2: int32, b3: int32) -> string
   return r;
 }
 
-fn pok(a: Arena*, s: string) -> GrpcJson* {
+fn pok(a: GrpcArena*, s: string) -> GrpcJson* {
   var out: GrpcJson* = (GrpcJson*)0;
   var e: string = grpc_json_parse(a, s, &out);
   if (e != "") {
@@ -26,7 +26,7 @@ fn pok(a: Arena*, s: string) -> GrpcJson* {
   return out;
 }
 
-fn perr(a: Arena*, s: string) -> string {
+fn perr(a: GrpcArena*, s: string) -> string {
   var out: GrpcJson* = (GrpcJson*)0;
   var e: string = grpc_json_parse(a, s, &out);
   if (e != "" && out != 0) { return "out set on error"; }
@@ -36,20 +36,20 @@ fn perr(a: Arena*, s: string) -> string {
 }
 
 // The parsed number of a document, or -999 if it did not parse as one.
-fn num(a: Arena*, s: string) -> float64 {
+fn num(a: GrpcArena*, s: string) -> float64 {
   var j: GrpcJson* = pok(a, s);
   if (j == 0 || j->kind != GRPC_JSON_NUMBER) { return -999.0; }
   return j->num;
 }
 
-fn str_of(a: Arena*, s: string) -> string {
+fn str_of(a: GrpcArena*, s: string) -> string {
   var j: GrpcJson* = pok(a, s);
   if (j == 0 || j->kind != GRPC_JSON_STRING) { return "NOT A STRING"; }
   return j->str;
 }
 
-fn zeros(a: Arena*, n: int64) -> string {
-  var p: uint8* = (uint8*)arena_alloc(a, n + 1);
+fn zeros(a: GrpcArena*, n: int64) -> string {
+  var p: uint8* = (uint8*)grpc_arena_alloc(a, n + 1);
   for i in 0..n { p[i] = 48; }
   var r: string;
   r.chars = p;
@@ -58,7 +58,7 @@ fn zeros(a: Arena*, n: int64) -> string {
 }
 
 // n nested arrays (or objects) around a 1.
-fn nest(a: Arena*, n: int64, obj: bool) -> string {
+fn nest(a: GrpcArena*, n: int64, obj: bool) -> string {
   var open: string = "[";
   var close: string = "]";
   if (obj) {
@@ -66,7 +66,7 @@ fn nest(a: Arena*, n: int64, obj: bool) -> string {
     close = "}";
   }
   var size: int64 = n * (int64)(open.length + close.length) + 1;
-  var buf: uint8* = (uint8*)arena_alloc(a, size);
+  var buf: uint8* = (uint8*)grpc_arena_alloc(a, size);
   var o: int64 = 0;
   for i in 0..n {
     for k in 0..(int64)open.length {
@@ -97,7 +97,7 @@ fn close_to(got: float64, want: float64) -> bool {
 }
 
 // The input must either parse or fail; it must never crash.
-fn survive(a: Arena*, s: string) -> int32 {
+fn survive(a: GrpcArena*, s: string) -> int32 {
   var out: GrpcJson* = (GrpcJson*)0;
   var e: string = grpc_json_parse(a, s, &out);
   if (e == "") {
@@ -108,7 +108,7 @@ fn survive(a: Arena*, s: string) -> int32 {
 }
 
 fn main() -> int32 {
-  var a: Arena* = arena_init(0);
+  var a: GrpcArena* = grpc_arena_new();
 
   // ---- every kind ----
   var j: GrpcJson* = pok(a, "null");
@@ -144,7 +144,7 @@ fn main() -> int32 {
   }
 
   // A long array forces the buffer to grow several times.
-  var big: uint8* = (uint8*)arena_alloc(a, 2000);
+  var big: uint8* = (uint8*)grpc_arena_alloc(a, 2000);
   var bo: int64 = 0;
   big[bo] = 91;
   bo = bo + 1;
@@ -345,7 +345,7 @@ fn main() -> int32 {
     if (res == 1) { ok_count = ok_count + 1; }
     if (res == 0) { bad_count = bad_count + 1; }
     if (res < 0) { neg = neg + 1; }
-    if (it % 200 == 199) { arena_reset(a); }
+    if (it % 200 == 199) { grpc_arena_reset(a); }
   }
   t_eq("fuzz random no tree", neg, 0);
   t_ok("fuzz random mostly rejected", bad_count > 3000);
@@ -397,7 +397,7 @@ fn main() -> int32 {
     if (res == 1) { mut_ok = mut_ok + 1; }
     if (res == 0) { mut_bad = mut_bad + 1; }
     if (res < 0) { neg = neg + 1; }
-    if (it % 200 == 199) { arena_reset(a); }
+    if (it % 200 == 199) { grpc_arena_reset(a); }
   }
   t_eq("fuzz mutate no tree", neg, 0);
   t_ok("fuzz mutate rejects some", mut_bad > 500);
@@ -414,6 +414,6 @@ fn main() -> int32 {
   }
   t_eq("no proper prefix parses", prefix_ok, 0);
 
-  arena_free(a);
+  grpc_arena_free(a);
   return t_done("json");
 }

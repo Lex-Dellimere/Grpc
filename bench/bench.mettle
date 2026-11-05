@@ -1,0 +1,151 @@
+// Loopback benchmark, the same workloads as grpc-go's benchmain with one
+// call at a time: unary with 1-byte messages, and streaming ping-pong with
+// 1 KiB messages. Prints latency percentiles and calls per second.
+//
+//   mbuild bench            (builds in release and runs)
+import "std/io";
+import "std/mem";
+import "std/core";
+import "std/socket";
+import "std/netaddr";
+import "std/thread";
+import "grpc/grpc";
+
+var g_listen: int64 = -1;
+var g_srv: GrpcServer;
+
+fn echo_msg(u: rawptr, c: GrpcCall*, m: GrpcBytes*) { grpc_srv_send(c, *m); }
+fn echo_close(u: rawptr, c: GrpcCall*) { grpc_srv_finish(c, grpc_status(GRPC_OK, "")); }
+
+fn server_main(arg: cstring) -> uint32 {
+  var peer: NetAddr;
+  var fd: int64 = sock_accept(g_listen, &peer);
+  if (fd < 0) { return 1; }
+  sock_set_option(fd, NET_OPT_NODELAY, 1);
+  var t: GrpcH2;
+  grpc_h2_init(&t, net_stream_socket(fd), true, (H2cConfig*)0);
+  var sc: GrpcServerConn;
+  grpc_server_conn_init(&sc, &g_srv, grpc_h2_transport(&t));
+  grpc_server_conn_serve(&sc);
+  grpc_server_conn_free(&sc);
+  grpc_h2_free(&t);
+  return 0;
+}
+
+fn sort(a: int64*, n: int64) {
+  // Shell sort: plenty for a few hundred thousand samples.
+  var gap: int64 = n / 2;
+  while (gap > 0) {
+    for i in gap..n {
+      var v: int64 = a[i];
+      var j: int64 = i;
+      while (j >= gap && a[j - gap] > v) {
+        a[j] = a[j - gap];
+        j = j - gap;
+      }
+      a[j] = v;
+    }
+    gap = gap / 2;
+  }
+}
+
+fn report(name: string, lat: int64*, n: int64, total_ns: int64) {
+  sort(lat, n);
+  var sum: int64 = 0;
+  for i in 0..n { sum = sum + lat[i]; }
+  var p50: int64 = lat[n / 2] / 1000;
+  var p90: int64 = lat[n * 9 / 10] / 1000;
+  var p99: int64 = lat[n * 99 / 100] / 1000;
+  var avg: int64 = sum / n / 1000;
+  var qps: int64 = n * 1000000000 / total_ns;
+  println("{name}: {n} calls, p50 {p50} us, p90 {p90} us, p99 {p99} us, avg {avg} us, {qps} calls/s");
+}
+
+fn main() -> int32 {
+  var sopts: GrpcServerOptions;
+  grpc_server_init(&g_srv, &sopts);
+  var d: GrpcMethodDesc;
+  d.path = "/b.B/Unary";
+  d.kind = GRPC_UNARY;
+  d.on_message = &echo_msg;
+  d.on_half_close = &echo_close;
+  grpc_server_add(&g_srv, &d);
+  d.path = "/b.B/Stream";
+  d.kind = GRPC_BIDI_STREAMING;
+  grpc_server_add(&g_srv, &d);
+
+  var any: NetAddr = net_addr_loopback(NET_IPV4, 0);
+  match (tcp_listen(&any, 4)) {
+    case Ok(fd): { g_listen = fd; }
+    case Err(e): { println("cannot listen"); return 1; }
+  }
+  var sa: NetAddr;
+  sock_local_addr(g_listen, &sa);
+  var tid: uint32 = 0;
+  var th: int64 = CreateThread((cstring)0, (uint64)0, &server_main, (cstring)0, (uint32)0, &tid);
+  var fd: int64 = tcp_connect_addr(&sa, 2000);
+  sock_set_option(fd, NET_OPT_NODELAY, 1);
+  var t: GrpcH2;
+  grpc_h2_init(&t, net_stream_socket(fd), false, (H2cConfig*)0);
+  var copts: GrpcChannelOptions;
+  var ch: GrpcChannel;
+  grpc_channel_init(&ch, grpc_h2_transport(&t), &copts);
+  var o: GrpcCallOptions = grpc_call_options();
+  var max: int64 = 2000000;
+  var lat: int64* = (int64*)malloc(max * 8);
+  var run_ns: int64 = 5000000000;
+
+  // Unary, 1-byte request and response.
+  var one: uint8[1];
+  one[0] = 7;
+  var req: GrpcBytes;
+  req.data = &one[0];
+  req.len = 1;
+  for i in 0..1000 {
+    var c0: GrpcCall* = grpc_call_start(&ch, "/b.B/Unary", GRPC_UNARY, &o);
+    grpc_call_finish(c0);
+    grpc_call_free(c0);
+  }
+  var n: int64 = 0;
+  var start: int64 = grpc_now_ns();
+  while (n < max && grpc_now_ns() - start < run_ns) {
+    var t0: int64 = grpc_now_ns();
+    var c: GrpcCall* = grpc_call_start(&ch, "/b.B/Unary", GRPC_UNARY, &o);
+    grpc_call_send(c, req);
+    grpc_call_close_send(c);
+    var m: GrpcBytes;
+    grpc_call_recv(c, &m);
+    var st: GrpcStatus = grpc_call_finish(c);
+    grpc_call_free(c);
+    if (st.code != GRPC_OK) { println("unary failed: {st.code}"); return 1; }
+    lat[n] = grpc_now_ns() - t0;
+    n = n + 1;
+  }
+  report("unary 1 B", lat, n, grpc_now_ns() - start);
+
+  // Streaming ping-pong, 1 KiB each way.
+  var kb: uint8* = (uint8*)calloc(1, 1024);
+  var msg: GrpcBytes;
+  msg.data = kb;
+  msg.len = 1024;
+  var s: GrpcCall* = grpc_call_start(&ch, "/b.B/Stream", GRPC_BIDI_STREAMING, &o);
+  n = 0;
+  start = grpc_now_ns();
+  while (n < max && grpc_now_ns() - start < run_ns) {
+    var t1: int64 = grpc_now_ns();
+    grpc_call_send(s, msg);
+    var m2: GrpcBytes;
+    if (!grpc_call_recv(s, &m2)) { println("stream ended"); return 1; }
+    lat[n] = grpc_now_ns() - t1;
+    n = n + 1;
+  }
+  report("streaming 1 KiB", lat, n, grpc_now_ns() - start);
+  grpc_call_close_send(s);
+  grpc_call_finish(s);
+  grpc_call_free(s);
+
+  grpc_channel_close(&ch);
+  grpc_h2_free(&t);
+  thread_join_infinite(th);
+  return 0;
+}

@@ -5,7 +5,7 @@
 // outside 0x20..0x7E, and '%' itself, become %XX.
 import "std/mem";
 import "std/strbuf";
-import "std/arena";
+import "grpc/arena";
 
 export const GRPC_OK = 0;
 export const GRPC_CANCELLED = 1;
@@ -195,20 +195,20 @@ export fn grpc_message_decode(s: string, out: uint8*) -> int64 {
 }
 
 // Arena helpers: copies of the encoded and decoded forms.
-export fn grpc_message_encode_in(a: Arena*, s: string) -> string {
+export fn grpc_message_encode_in(a: GrpcArena*, s: string) -> string {
   var n: int64 = grpc_message_encoded_len(s);
   var r: string;
   if (n == 0) { return r; }
-  var p: uint8* = (uint8*)arena_alloc(a, n);
+  var p: uint8* = (uint8*)grpc_arena_alloc(a, n);
   r.chars = p;
   r.length = (uint64)grpc_message_encode(s, p);
   return r;
 }
 
-export fn grpc_message_decode_in(a: Arena*, s: string) -> string {
+export fn grpc_message_decode_in(a: GrpcArena*, s: string) -> string {
   var r: string;
   if (s.length == 0) { return r; }
-  var p: uint8* = (uint8*)arena_alloc(a, (int64)s.length);
+  var p: uint8* = (uint8*)grpc_arena_alloc(a, (int64)s.length);
   r.chars = p;
   r.length = (uint64)grpc_message_decode(s, p);
   return r;

@@ -10,7 +10,7 @@
 // server's response headers arrive or the log passes retry_buffer bytes.
 // Keepalive follows gRFC A8; reconnect backoff doc/connection-backoff.md.
 import "std/mem";
-import "std/arena";
+import "grpc/arena";
 import "std/hpack";
 import "std/random";
 import "std/time";
@@ -241,7 +241,7 @@ fn start_attempt(ch: GrpcChannel*, c: GrpcCall*, counted: bool) -> int32 {
     var r: int32 = reconnect(ch, c);
     if (r <= 0) { return r; }
   }
-  var a: Arena* = arena_init(4096);
+  var a: GrpcArena* = grpc_arena_new();
   var hl: GrpcHeaderList;
   grpc_hl_init(&hl, a);
   var head: GrpcRequestHead;
@@ -272,7 +272,7 @@ fn start_attempt(ch: GrpcChannel*, c: GrpcCall*, counted: bool) -> int32 {
     grpc_request_headers(&head, &md, &hl);
   }
   var id: int64 = ch->t.open_stream(ch->t.user, hl.items, hl.count, false);
-  arena_free(a);
+  grpc_arena_free(a);
   if (id == GRPC_T_NO_SLOT) {
     // Try again on GRPC_TEV_SLOT, or after a short wait.
     c->wait_slot = true;
@@ -770,7 +770,7 @@ export fn grpc_call_start(ch: GrpcChannel*, path: string, kind: int32, o: GrpcCa
   }
   if (o->wait_for_ready >= 0) {
     // A call option beats the service config; keep it in a copy.
-    var mc: GrpcMethodConfig* = (GrpcMethodConfig*)arena_alloc_zeroed(c->arena, sizeof(GrpcMethodConfig));
+    var mc: GrpcMethodConfig* = (GrpcMethodConfig*)grpc_arena_alloc_zeroed(c->arena, sizeof(GrpcMethodConfig));
     if (c->mc != 0) { *mc = *c->mc; } else { mc->wait_for_ready = -1; }
     mc->wait_for_ready = o->wait_for_ready;
     c->mc = mc;
