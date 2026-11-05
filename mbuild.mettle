@@ -18,13 +18,17 @@ fn deps() {
   mb_dep_path("codec", "../codec");
 }
 
-// gen: rebuilds the protobuf code in src/gen from proto/ with Codec's
-// compiler (../codec). Types get the GrpcPb prefix.
+// gen: rebuilds the generated code in src/gen and tests/gen: messages with
+// Codec's compiler (../codec), services with grpc_gen. Types in src/gen get
+// the GrpcPb prefix.
 fn cmd_gen(a: MbArgs*) -> int32 {
   if (mb_sh("cd ../codec && mbuild build codec_protoc") != 0) { return 1; }
   var exe: string = "../codec/build/" + mb_os() + "/debug/codec_protoc";
-  if (mb_sh(exe + " -I proto --out src/gen --prefix GrpcPb google/rpc/status.proto google/rpc/error_details.proto grpc/health/v1/health.proto grpc/reflection/v1/reflection.proto google/protobuf/descriptor.proto") != 0) { return 1; }
-  // The test stubs come from this library's own generator.
+  if (mb_sh(exe + " -I proto --out src/gen --prefix GrpcPb google/rpc/status.proto google/rpc/error_details.proto google/protobuf/descriptor.proto") != 0) { return 1; }
+  // Services go through this library's own generator, which needs the
+  // descriptor code above.
   if (mb_mbuild("build grpc_gen") != 0) { return 1; }
-  return mb_sh(mb_out("grpc_gen", mb_os(), "debug") + " -I tests/proto -I proto --out tests/gen --prefix T echo.proto");
+  var gen: string = mb_out("grpc_gen", mb_os(), "debug");
+  if (mb_sh(gen + " -I proto --out src/gen --prefix GrpcPb grpc/health/v1/health.proto grpc/reflection/v1/reflection.proto") != 0) { return 1; }
+  return mb_sh(gen + " -I tests/proto -I proto --out tests/gen --prefix T echo.proto");
 }

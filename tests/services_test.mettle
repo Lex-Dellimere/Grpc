@@ -1,0 +1,154 @@
+// The health and reflection services, called through their generated
+// client stubs over the in-memory transport.
+import "grpc/grpc";
+import "grpc/gen/grpc/health/v1/health_pb";
+import "grpc/gen/grpc/health/v1/health_grpc";
+import "grpc/gen/grpc/reflection/v1/reflection_pb";
+import "grpc/gen/grpc/reflection/v1/reflection_grpc";
+import "gen/echo_grpc";
+import "tutil";
+import "std/mem";
+
+fn idle_server(u: rawptr) {
+  grpc_server_conn_poll((GrpcServerConn*)u);
+}
+
+fn check(ch: GrpcChannel*, service: string) -> int32 {
+  var req: GrpcPbHealthCheckRequest;
+  GrpcPbHealthCheckRequest_init(&req);
+  req.service = service;
+  var resp: GrpcPbHealthCheckResponse;
+  GrpcPbHealthCheckResponse_init(&resp);
+  var buf: GrpcBytes;
+  var o: GrpcCallOptions = grpc_call_options();
+  var st: GrpcStatus = GrpcPbHealth_Check(ch, &req, &resp, &buf, &o);
+  if (buf.data != 0) { free(buf.data); }
+  if (st.code != GRPC_OK) { return -st.code; }
+  return resp.status;
+}
+
+fn has(list: CodecList<GrpcPbServiceResponse>*, name: string) -> bool {
+  for i in 0..list->len {
+    if (list->data[i].name == name) { return true; }
+  }
+  return false;
+}
+
+fn main() -> int32 {
+  var sopts: GrpcServerOptions;
+  var srv: GrpcServer;
+  grpc_server_init(&srv, &sopts);
+  var health: GrpcHealth;
+  grpc_health_init(&health);
+  grpc_health_register(&health, &srv);
+  var refl: GrpcReflection;
+  grpc_reflection_init(&refl);
+  t_ok("add echo", grpc_reflection_add(&refl, &TEcho_file_descriptors));
+  grpc_reflection_add(&refl, &GrpcPbHealth_file_descriptors);
+  grpc_reflection_register(&refl, &srv);
+
+  var pipe: GrpcMemPipe;
+  grpc_mem_pipe_init(&pipe);
+  var sc: GrpcServerConn;
+  grpc_server_conn_init(&sc, &srv, grpc_mem_transport(&pipe.server));
+  pipe.client.idle = &idle_server;
+  pipe.client.idle_user = (rawptr)&sc;
+  var copts: GrpcChannelOptions;
+  var ch: GrpcChannel;
+  grpc_channel_init(&ch, grpc_mem_transport(&pipe.client), &copts);
+  var o: GrpcCallOptions = grpc_call_options();
+
+  // Health: Check.
+  t_eq("server serving", check(&ch, ""), GRPC_HEALTH_SERVING);
+  t_eq("unknown", check(&ch, "test.echo.Echo"), -GRPC_NOT_FOUND);
+  grpc_health_set(&health, "test.echo.Echo", GRPC_HEALTH_NOT_SERVING);
+  t_eq("set", check(&ch, "test.echo.Echo"), GRPC_HEALTH_NOT_SERVING);
+
+  // Health: Watch sees the current status, then changes.
+  var wreq: GrpcPbHealthCheckRequest;
+  GrpcPbHealthCheckRequest_init(&wreq);
+  wreq.service = "test.echo.Echo";
+  var w: GrpcCall* = GrpcPbHealth_Watch_start(&ch, &wreq, &o);
+  var wr: GrpcPbHealthCheckResponse;
+  GrpcPbHealthCheckResponse_init(&wr);
+  t_ok("watch first", GrpcPbHealth_Watch_recv(w, &wr) && wr.status == GRPC_HEALTH_NOT_SERVING);
+  grpc_health_set(&health, "test.echo.Echo", GRPC_HEALTH_SERVING);
+  t_ok("watch change", GrpcPbHealth_Watch_recv(w, &wr) && wr.status == GRPC_HEALTH_SERVING);
+  grpc_health_set(&health, "test.echo.Echo", GRPC_HEALTH_SERVING);
+  grpc_health_set(&health, "other", GRPC_HEALTH_SERVING);
+  grpc_health_shutdown(&health);
+  t_ok("watch shutdown", GrpcPbHealth_Watch_recv(w, &wr) && wr.status == GRPC_HEALTH_NOT_SERVING);
+  grpc_call_cancel(w);
+  grpc_call_free(w);
+  grpc_server_conn_poll(&sc);
+  t_eq("watcher dropped", health.watchers.len, 0);
+
+  // Health: List.
+  var lreq: GrpcPbHealthListRequest;
+  GrpcPbHealthListRequest_init(&lreq);
+  var lresp: GrpcPbHealthListResponse;
+  GrpcPbHealthListResponse_init(&lresp);
+  var buf: GrpcBytes;
+  t_eq("list ok", GrpcPbHealth_List(&ch, &lreq, &lresp, &buf, &o).code, GRPC_OK);
+  t_eq("list size", lresp.statuses.len, 3);
+  free(buf.data);
+
+  // Reflection on v1 and on v1alpha.
+  for pass in 0..2 {
+    var rc: GrpcCall* = (GrpcCall*)0;
+    if (pass == 0) {
+      rc = GrpcPbServerReflection_ServerReflectionInfo_start(&ch, &o);
+    } else {
+      rc = grpc_call_start(&ch, GRPC_REFLECTION_V1ALPHA_PATH, GRPC_BIDI_STREAMING, &o);
+    }
+    var rq: GrpcPbServerReflectionRequest;
+    GrpcPbServerReflectionRequest_init(&rq);
+    var rs: GrpcPbServerReflectionResponse;
+    GrpcPbServerReflectionResponse_init(&rs);
+    rq.list_services = "*";
+    rq.message_request_case = GrpcPbServerReflectionRequest_FIELD_list_services;
+    GrpcPbServerReflection_ServerReflectionInfo_write(rc, &rq);
+    t_ok("list services {pass}", GrpcPbServerReflection_ServerReflectionInfo_recv(rc, &rs) && rs.list_services_response != 0);
+    if (rs.list_services_response != 0) {
+      var ls: CodecList<GrpcPbServiceResponse>* = &rs.list_services_response->service;
+      t_ok("has echo {pass}", has(ls, "test.echo.Echo"));
+      t_ok("has health {pass}", has(ls, "grpc.health.v1.Health"));
+      t_ok("has reflection {pass}", has(ls, "grpc.reflection.v1.ServerReflection"));
+    }
+    GrpcPbServerReflectionRequest_init(&rq);
+    rq.file_containing_symbol = "test.echo.EchoRequest.Mode";
+    rq.message_request_case = GrpcPbServerReflectionRequest_FIELD_file_containing_symbol;
+    GrpcPbServerReflection_ServerReflectionInfo_write(rc, &rq);
+    t_ok("symbol {pass}", GrpcPbServerReflection_ServerReflectionInfo_recv(rc, &rs) && rs.file_descriptor_response != 0);
+    if (rs.file_descriptor_response != 0) {
+      t_eq("symbol files {pass}", rs.file_descriptor_response->file_descriptor_proto.len, 2);
+    }
+    GrpcPbServerReflectionRequest_init(&rq);
+    rq.file_containing_symbol = "test.echo.Echo.Chat";
+    rq.message_request_case = GrpcPbServerReflectionRequest_FIELD_file_containing_symbol;
+    GrpcPbServerReflection_ServerReflectionInfo_write(rc, &rq);
+    t_ok("method symbol {pass}", GrpcPbServerReflection_ServerReflectionInfo_recv(rc, &rs) && rs.file_descriptor_response != 0);
+    GrpcPbServerReflectionRequest_init(&rq);
+    rq.file_by_filename = "nope.proto";
+    rq.message_request_case = GrpcPbServerReflectionRequest_FIELD_file_by_filename;
+    GrpcPbServerReflection_ServerReflectionInfo_write(rc, &rq);
+    t_ok("missing file {pass}", GrpcPbServerReflection_ServerReflectionInfo_recv(rc, &rs) && rs.error_response != 0 && rs.error_response->error_code == GRPC_NOT_FOUND);
+    GrpcPbServerReflectionRequest_init(&rq);
+    rq.file_by_filename = "google/protobuf/duration.proto";
+    rq.message_request_case = GrpcPbServerReflectionRequest_FIELD_file_by_filename;
+    GrpcPbServerReflection_ServerReflectionInfo_write(rc, &rq);
+    t_ok("by name {pass}", GrpcPbServerReflection_ServerReflectionInfo_recv(rc, &rs) && rs.file_descriptor_response != 0 && rs.file_descriptor_response->file_descriptor_proto.len == 1);
+    grpc_call_close_send(rc);
+    t_eq("reflection ends ok {pass}", grpc_call_finish(rc).code, GRPC_OK);
+    GrpcPbServerReflectionResponse_free(&rs);
+    grpc_call_free(rc);
+  }
+
+  grpc_channel_close(&ch);
+  grpc_server_conn_free(&sc);
+  grpc_mem_pipe_free(&pipe);
+  grpc_health_free(&health);
+  grpc_reflection_free(&refl);
+  grpc_server_free(&srv);
+  return t_done("services");
+}
