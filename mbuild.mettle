@@ -8,7 +8,7 @@ fn project() {
   mb_package("grpc", "0.1.0");
   mb_meta("description", "gRPC clients and servers in pure Mettle");
   mb_meta("license", "Apache-2.0");
-  mb_meta("repository", "https://github.com/Lex-Dellimere/grpc");
+  mb_meta("repository", "https://github.com/Lex-Dellimere/Grpc");
   mb_import_root("src");
   mb_bin("grpc_gen", "tools/grpc_gen/main.mettle");
   mb_bin("example_greeter", "examples/greeter/main.mettle");

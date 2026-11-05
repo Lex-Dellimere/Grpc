@@ -16,7 +16,8 @@ gRPC clients and servers for Mettle, in pure Mettle.
 - TLS and mutual TLS (h2 over ALPN) through mtls
 
 Follows the [gRPC over HTTP/2 protocol](https://github.com/grpc/grpc/blob/master/doc/PROTOCOL-HTTP2.md).
-HTTP/2 itself comes from the standard library's `std/http2`.
+HTTP/2 itself comes from the standard library (`std/http2`, `std/h2conn`),
+so it needs a Mettle compiler from November 2026 or later.
 
 Transports: HTTP/2 over TCP (std/h2conn), TLS and mutual TLS through
 [mtls](https://github.com/Lex-Dellimere/mtls), and an in-memory pair.
@@ -85,12 +86,12 @@ var st: GrpcStatus = Greeter_SayHello(&ch, &req, &resp, &buf, &o);
 
 `mbuild bench` runs one call at a time over loopback, the same workloads
 as grpc-go's `benchmain` (`-maxConcurrentCalls=1 -networkMode=Local`), on
-the same machine:
+the same machine, release build:
 
 | Workload | grpc (Mettle) p50 / avg | grpc-go v1.80 p50 / avg |
 |---|---|---|
-| unary, 1 B each way | 58 us / 73 us | 141 us / 174 us |
-| streaming ping-pong, 1 KiB | 27 us / 36 us | 70 us / 93 us |
+| unary, 1 B each way | 25 us / 27 us | 57 us / 64 us |
+| streaming ping-pong, 1 KiB | 13 us / 14 us | 31 us / 35 us |
 
 ## Docs
 

@@ -33,6 +33,9 @@ src/svcconfig.mettle    service config, retry/hedging policy, throttle
 src/errors.mettle       rich error details (google.rpc.Status, Any)
 src/health.mettle       grpc.health.v1
 src/reflection.mettle   grpc.reflection.v1 (+ v1alpha)
+src/h2.mettle           HTTP/2 transport on std/h2conn
+src/tls.mettle          TLS and mutual TLS through mtls
+src/arena.mettle        malloc-backed bump allocator
 src/gen/                generated protobuf code (mbuild gen)
 tools/grpc_gen/         stub generator on Codec's .proto parser
 ```
@@ -43,15 +46,14 @@ tools/grpc_gen/         stub generator on Codec's .proto parser
 2. call layer, client and server, against a transport table: done
 3. retries, hedging, throttling, service config, keepalive: done
 4. stub generator, health, reflection, rich errors: done
-5. std/http2 transport adapter (needs the stdlib connection layer)
-6. TLS via mtls (ALPN h2), mutual TLS
-7. interop: grpc.testing cases against grpc-go v1.80 client and server
-8. benchmarks against grpc-go
+5. HTTP/2 transport on std/h2conn: done
+6. TLS via mtls (ALPN h2), mutual TLS: done
+7. interop: grpc.testing cases against grpc-go v1.80 client and server: done
+8. benchmarks against grpc-go: done
 
-## What grpc needs from std/http2
+## HTTP/2
 
-The framing and HPACK are there. The connection layer (stream state, flow
-control, SETTINGS, CONTINUATION, RST/GOAWAY/PING, concurrency limits, h2c
-prior knowledge, a pluggable byte transport for mtls) is coming in the
-stdlib session's next PR. The interface grpc wants is the GrpcTransport
-table in src/transport.mettle; the adapter maps it onto the connection API.
+std/http2 (framing), std/hpack and std/h2conn (the connection: streams,
+flow control, GOAWAY, PING, over a NetStream) come from the standard
+library. src/h2.mettle maps the GrpcTransport table onto std/h2conn;
+src/tls.mettle gives it an mtls stream.
