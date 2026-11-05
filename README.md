@@ -2,22 +2,106 @@
 
 gRPC clients and servers for Mettle, in pure Mettle.
 
-Status: design stage. The code lands once the `http` package (HTTP/2) is
-ready. See [PLAN.md](PLAN.md) for the layout and build order.
-
-Planned:
-
-- Client and server stubs generated from `.proto` files (on top of Codec's
-  protobuf compiler)
-- Unary, server streaming, client streaming and bidirectional streaming calls
-- Deadlines, cancellation, metadata, status codes and rich error details
-- Compression (gzip and deflate through Press)
-- Interceptors, retries and hedging from the service config
-- Keepalive, the health and reflection services
-- TLS and mutual TLS through mtls
+- All four call kinds: unary, server streaming, client streaming, bidirectional
+- Stubs generated from `.proto` files (`grpc_gen`, built on Codec's protobuf compiler)
+- Deadlines (`grpc-timeout`), cancellation, deadline propagation to child calls
+- Metadata in both directions, binary (`-bin`) values, status codes,
+  rich error details (`google.rpc.Status` with `ErrorInfo`, `RetryInfo`...)
+- gzip and deflate message compression (through Press)
+- Client and server interceptors
+- Service config: per-method timeouts, size limits, wait-for-ready,
+  retries and hedging with retry throttling and server pushback (gRFC A6)
+- Keepalive pings and server enforcement, connection idle and age limits (gRFC A8, A9)
+- Health (`grpc.health.v1`) and reflection (`grpc.reflection.v1`, `v1alpha`) services
 
 Follows the [gRPC over HTTP/2 protocol](https://github.com/grpc/grpc/blob/master/doc/PROTOCOL-HTTP2.md).
+HTTP/2 itself comes from the standard library's `std/http2`.
+
+## Status
+
+Everything above HTTP/2 is done and tested over an in-memory transport.
+Running over the network waits for the `std/http2` connection layer;
+TLS will come through [mtls](https://github.com/Lex-Dellimere/mtls).
+
+## Use
+
+```mettle
+// mbuild.mettle
+fn deps() {
+  mb_dep_path("grpc", "../grpc");
+  mb_dep_path("codec", "../codec");
+  mb_dep_path("press", "../press");
+}
+```
+
+Generate code from a `.proto` file:
+
+```bash
+mbuild build grpc_gen
+build/linux/debug/grpc_gen -I proto --out src/gen helloworld.proto
+```
+
+That writes `helloworld_pb.mettle` (messages) and `helloworld_grpc.mettle`
+(stubs). A server:
+
+```mettle
+import "grpc/grpc";
+import "gen/helloworld_grpc";
+
+fn say_hello(u: rawptr, c: GrpcCall*, req: HelloRequest*, resp: HelloReply*) -> GrpcStatus {
+  resp->message = "Hello " + req->name;
+  return grpc_status(GRPC_OK, "");
+}
+
+var h: Greeter_Handlers;
+h.SayHello = &say_hello;
+var srv: GrpcServer;
+var opts: GrpcServerOptions;
+grpc_server_init(&srv, &opts);
+Greeter_register(&srv, &h);
+// then grpc_server_conn_init(&conn, &srv, transport) and grpc_server_conn_serve(&conn)
+```
+
+A client:
+
+```mettle
+var ch: GrpcChannel;
+var copts: GrpcChannelOptions;
+grpc_channel_init(&ch, transport, &copts);
+var req: HelloRequest;
+HelloRequest_init(&req);
+req.name = "world";
+var resp: HelloReply;
+HelloReply_init(&resp);
+var buf: GrpcBytes;
+var o: GrpcCallOptions = grpc_call_options();
+o.timeout_ns = 1000000000;
+var st: GrpcStatus = Greeter_SayHello(&ch, &req, &resp, &buf, &o);
+```
+
+[examples/greeter](examples/greeter) runs both in one process.
+
+## Docs
+
+- [docs/api.md](docs/api.md): the library API
+- [docs/codegen.md](docs/codegen.md): what `grpc_gen` generates
+- [docs/references.md](docs/references.md): standards followed and what came from where
+
+## Tests
+
+```bash
+mbuild test
+mbuild test -r
+```
+
+The tests cover every call kind, metadata, deadlines, cancellation,
+compression and limits, interceptors, retries, hedging, the generated
+stubs, health, reflection, rich errors, and fuzzing of the header parsers
+and of the client and server against random events. `mbuild gen`
+regenerates `src/gen` and `tests/gen` (it needs `../codec`).
 
 ## License
 
-Apache-2.0. See [LICENSE](LICENSE).
+Apache-2.0. See [LICENSE](LICENSE). The files in `proto/` come from
+grpc/grpc-proto and googleapis (Apache-2.0) and protocolbuffers/protobuf
+(BSD-3-Clause); their own headers say so.

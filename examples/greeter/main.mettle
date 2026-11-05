@@ -1,0 +1,83 @@
+// The greeter: a server and a client in one process, joined by the
+// in-memory transport. With std/http2 the same code runs over TCP; only
+// the transport changes.
+import "std/io";
+import "std/mem";
+import "grpc/grpc";
+import "gen/helloworld_grpc";
+
+fn say_hello(u: rawptr, c: GrpcCall*, req: HelloRequest*, resp: HelloReply*) -> GrpcStatus {
+  if (req->name.length == 0) { return grpc_status(GRPC_INVALID_ARGUMENT, "name is empty"); }
+  resp->message = "Hello " + req->name;
+  return grpc_status(GRPC_OK, "");
+}
+
+fn say_hello_stream(u: rawptr, c: GrpcCall*, req: HelloRequest*) -> GrpcStatus {
+  var langs: string[3] = ["Hello", "Hola", "Bonjour"];
+  for i in 0..3 {
+    var r: HelloReply;
+    HelloReply_init(&r);
+    r.message = langs[i] + " " + req->name;
+    Greeter_SayHelloStream_reply(c, &r);
+  }
+  return grpc_status(GRPC_OK, "");
+}
+
+// The client end runs the server whenever it waits (one thread).
+fn run_server(u: rawptr) {
+  grpc_server_conn_poll((GrpcServerConn*)u);
+}
+
+fn main() -> int32 {
+  var h: Greeter_Handlers;
+  h.SayHello = &say_hello;
+  h.SayHelloStream = &say_hello_stream;
+  var sopts: GrpcServerOptions;
+  var srv: GrpcServer;
+  grpc_server_init(&srv, &sopts);
+  Greeter_register(&srv, &h);
+
+  var pipe: GrpcMemPipe;
+  grpc_mem_pipe_init(&pipe);
+  var conn: GrpcServerConn;
+  grpc_server_conn_init(&conn, &srv, grpc_mem_transport(&pipe.server));
+  pipe.client.idle = &run_server;
+  pipe.client.idle_user = (rawptr)&conn;
+
+  var copts: GrpcChannelOptions;
+  var ch: GrpcChannel;
+  grpc_channel_init(&ch, grpc_mem_transport(&pipe.client), &copts);
+  var o: GrpcCallOptions = grpc_call_options();
+  o.timeout_ns = 1000000000;
+
+  var req: HelloRequest;
+  HelloRequest_init(&req);
+  req.name = "world";
+  var resp: HelloReply;
+  HelloReply_init(&resp);
+  var buf: GrpcBytes;
+  var st: GrpcStatus = Greeter_SayHello(&ch, &req, &resp, &buf, &o);
+  if (st.code != GRPC_OK) {
+    println("SayHello failed: {grpc_code_name(st.code)} {st.message}");
+    return 1;
+  }
+  println(resp.message);
+  free(buf.data);
+
+  var c: GrpcCall* = Greeter_SayHelloStream_start(&ch, &req, &o);
+  HelloReply_init(&resp);
+  while (Greeter_SayHelloStream_recv(c, &resp)) { println(resp.message); }
+  st = grpc_call_finish(c);
+  grpc_call_free(c);
+
+  req.name = "";
+  st = Greeter_SayHello(&ch, &req, &resp, &buf, &o);
+  println("empty name: {grpc_code_name(st.code)}: {st.message}");
+  grpc_status_free(&st);
+
+  grpc_channel_close(&ch);
+  grpc_server_conn_free(&conn);
+  grpc_mem_pipe_free(&pipe);
+  grpc_server_free(&srv);
+  return 0;
+}
