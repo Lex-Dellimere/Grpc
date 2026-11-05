@@ -81,6 +81,17 @@ var st: GrpcStatus = Greeter_SayHello(&ch, &req, &resp, &buf, &o);
 
 [examples/greeter](examples/greeter) runs both in one process.
 
+## Speed
+
+`mbuild bench` runs one call at a time over loopback, the same workloads
+as grpc-go's `benchmain` (`-maxConcurrentCalls=1 -networkMode=Local`), on
+the same machine:
+
+| Workload | grpc (Mettle) p50 / avg | grpc-go v1.80 p50 / avg |
+|---|---|---|
+| unary, 1 B each way | 58 us / 73 us | 141 us / 174 us |
+| streaming ping-pong, 1 KiB | 27 us / 36 us | 70 us / 93 us |
+
 ## Docs
 
 - [docs/api.md](docs/api.md): the library API

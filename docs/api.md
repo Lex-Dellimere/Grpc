@@ -3,6 +3,13 @@
 Every export starts with `grpc_`, `Grpc` or `GRPC_`. `import "grpc/grpc"`
 brings in all of it; single modules (`grpc/status`, `grpc/client`...) work too.
 
+## Memory
+
+The library allocates from `GrpcArena`, a bump allocator on malloc:
+`grpc_arena_new()`, `grpc_arena_alloc(a, n)`, `grpc_arena_reset(a)`,
+`grpc_arena_free(a)`. Functions that copy strings for you (metadata,
+service configs, JSON) take one. Each call has its own, freed with the call.
+
 ## Status
 
 `GRPC_OK` .. `GRPC_UNAUTHENTICATED` are the 17 codes of doc/statuscodes.md.
@@ -89,7 +96,7 @@ Set `copts.service_config` to a parsed config:
 
 ```mettle
 var cfg: GrpcServiceConfig;
-var err: string = grpc_svc_config_parse(arena, json_text, &cfg);   // "" when fine
+var err: string = grpc_svc_config_parse(grpc_arena_new(), json_text, &cfg);   // "" when fine
 ```
 
 The JSON is the one of doc/service_config.md. A call follows its method's
