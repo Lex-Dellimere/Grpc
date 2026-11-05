@@ -1,0 +1,636 @@
+// grpc_gen: compiles .proto files to Mettle: the messages (through Codec's
+// generator, as codec_protoc does) and, for files with services, gRPC
+// client and server stubs.
+//
+//   grpc_gen [-I DIR]... [--out DIR] [--prefix NAME] [--no-pb] FILE.proto...
+//
+// For a/b.proto it writes OUT/a/b_pb.mettle (messages, unless --no-pb) and
+// OUT/a/b_grpc.mettle (stubs). docs/codegen.md describes the stubs.
+import "std/io";
+import "std/mem";
+import "std/file";
+import "std/fs";
+import "codec/core/list";
+import "codec/core/rev";
+import "codec/proto/compiler/desc";
+import "codec/proto/compiler/resolve";
+import "codec/proto/compiler/gen";
+import "grpc/gen/google/protobuf/descriptor_pb";
+import "grpc/metadata";
+
+fn usage() -> int32 {
+  print_err("usage: grpc_gen [-I DIR]... [--out DIR] [--prefix NAME] [--no-pb] FILE.proto...\n");
+  return 2;
+}
+
+fn write_file(path: string, text: string) -> bool {
+  var i: int64 = (int64)path.length - 1;
+  while (i > 0 && path.chars[i] != 47) { i = i - 1; }
+  if (i > 0) {
+    var dir: string = path;
+    dir.length = (uint64)i;
+    fs_mkdir_all(dir, 493);
+  }
+  var fd: int64 = file_open(path, FILE_WRITE | FILE_CREATE | FILE_TRUNCATE);
+  if (fd < 0) { return false; }
+  var done: int64 = 0;
+  var n: int64 = (int64)text.length;
+  while (done < n) {
+    var k: int64 = file_write_at(fd, text.chars + done, n - done, done);
+    if (k <= 0) {
+      file_close(fd);
+      return false;
+    }
+    done = done + k;
+  }
+  file_close(fd);
+  return true;
+}
+
+fn str_of(c: cstring) -> string {
+  var s: string;
+  s.chars = (uint8*)c;
+  var n: int64 = 0;
+  while (s.chars[n] != 0) { n = n + 1; }
+  s.length = (uint64)n;
+  return s;
+}
+
+fn strip_proto(path: string) -> string {
+  var s: string = path;
+  var n: int64 = (int64)path.length;
+  if (n > 6 && path.chars[n - 6] == 46 && path.chars[n - 5] == 112) { s.length = (uint64)(n - 6); }
+  return s;
+}
+
+fn up(path: string) -> string {
+  var r: string = "";
+  for i in 0..(int64)path.length {
+    if (path.chars[i] == 47) { r = r + "../"; }
+  }
+  return r;
+}
+
+// ---- output ---------------------------------------------------------------------------
+
+struct Out {
+  text: string;
+}
+
+fn ln(o: Out*, s: string) {
+  o->text = o->text + s + "\n";
+}
+
+// ---- file descriptors for reflection ----------------------------------------------------
+
+fn dotted(full: string) -> string {
+  return "." + full;
+}
+
+fn build_field(set: CodecPbcSet*, f: CodecPbcField*) -> GrpcPbFieldDescriptorProto {
+  var d: GrpcPbFieldDescriptorProto;
+  GrpcPbFieldDescriptorProto_init(&d);
+  d.has_name = true;
+  d.name = f->name;
+  d.has_number = true;
+  d.number = f->number;
+  d.has_label = true;
+  d.label = f->label;
+  if (d.label == CODEC_PBL_NONE) { d.label = CODEC_PBL_OPTIONAL; }
+  d.has_type = true;
+  d.type_ = f->kind;
+  if (f->kind == CODEC_PBT_MESSAGE || f->kind == CODEC_PBT_GROUP) {
+    d.has_type_name = true;
+    d.type_name = dotted(set->messages.data[f->ref].full);
+  }
+  if (f->kind == CODEC_PBT_ENUM) {
+    d.has_type_name = true;
+    d.type_name = dotted(set->enums.data[f->ref].full);
+  }
+  if (f->has_default) {
+    d.has_default_value = true;
+    d.default_value = f->default_text;
+  }
+  if (f->oneof >= 0) {
+    d.has_oneof_index = true;
+    d.oneof_index = f->oneof;
+  }
+  if (f->packed >= 0) {
+    var op: GrpcPbFieldOptions* = new GrpcPbFieldOptions;
+    GrpcPbFieldOptions_init(op);
+    op->has_packed = true;
+    op->packed = f->packed == 1;
+    d.options = op;
+  }
+  return d;
+}
+
+fn build_enum(e: CodecPbcEnum*) -> GrpcPbEnumDescriptorProto {
+  var d: GrpcPbEnumDescriptorProto;
+  GrpcPbEnumDescriptorProto_init(&d);
+  d.has_name = true;
+  d.name = e->name;
+  for i in 0..e->values.len {
+    var v: GrpcPbEnumValueDescriptorProto;
+    GrpcPbEnumValueDescriptorProto_init(&v);
+    v.has_name = true;
+    v.name = e->values.data[i].name;
+    v.has_number = true;
+    v.number = e->values.data[i].number;
+    codec_list_push(&d.value, v);
+  }
+  return d;
+}
+
+// True if full is parent + "." + name.
+fn child_of(full: string, parent: string, name: string) -> bool {
+  return full == parent + "." + name;
+}
+
+fn build_message(set: CodecPbcSet*, mi: int32) -> GrpcPbDescriptorProto {
+  var m: CodecPbcMessage* = &set->messages.data[mi];
+  var d: GrpcPbDescriptorProto;
+  GrpcPbDescriptorProto_init(&d);
+  d.has_name = true;
+  d.name = m->name;
+  for i in 0..m->fields.len {
+    codec_list_push(&d.field, build_field(set, &m->fields.data[i]));
+  }
+  for i in 0..m->oneofs.len {
+    var od: GrpcPbOneofDescriptorProto;
+    GrpcPbOneofDescriptorProto_init(&od);
+    od.has_name = true;
+    od.name = m->oneofs.data[i].name;
+    codec_list_push(&d.oneof_decl, od);
+    if (m->oneofs.data[i].synthetic) {
+      // proto3 optional: mark the field.
+      for k in 0..d.field.len {
+        if (d.field.data[k].has_oneof_index && d.field.data[k].oneof_index == (int32)i) {
+          d.field.data[k].has_proto3_optional = true;
+          d.field.data[k].proto3_optional = true;
+        }
+      }
+    }
+  }
+  for k in 0..set->messages.len {
+    if (set->messages.data[k].parent == mi) {
+      codec_list_push(&d.nested_type, build_message(set, (int32)k));
+    }
+  }
+  for k in 0..set->enums.len {
+    var e: CodecPbcEnum* = &set->enums.data[k];
+    if (child_of(e->full, m->full, e->name)) { codec_list_push(&d.enum_type, build_enum(e)); }
+  }
+  if (m->map_entry) {
+    var op: GrpcPbMessageOptions* = new GrpcPbMessageOptions;
+    GrpcPbMessageOptions_init(op);
+    op->has_map_entry = true;
+    op->map_entry = true;
+    d.options = op;
+  }
+  return d;
+}
+
+fn top_name(pkg: string, name: string) -> string {
+  if (pkg.length == 0) { return name; }
+  return pkg + "." + name;
+}
+
+// The serialized FileDescriptorProto of file fi, base64 (unpadded).
+fn file_descriptor_b64(set: CodecPbcSet*, fi: int32) -> string {
+  var f: CodecPbcFile* = &set->files.data[fi];
+  var d: GrpcPbFileDescriptorProto;
+  GrpcPbFileDescriptorProto_init(&d);
+  d.has_name = true;
+  d.name = f->path;
+  if (f->package.length > 0) {
+    d.has_package = true;
+    d.package = f->package;
+  }
+  for i in 0..f->imports.len { codec_list_push(&d.dependency, f->imports.data[i]); }
+  for k in 0..set->messages.len {
+    var m: CodecPbcMessage* = &set->messages.data[k];
+    if (m->file == fi && m->parent < 0) { codec_list_push(&d.message_type, build_message(set, (int32)k)); }
+  }
+  for k in 0..set->enums.len {
+    var e: CodecPbcEnum* = &set->enums.data[k];
+    if (e->file == fi && e->full == top_name(f->package, e->name)) { codec_list_push(&d.enum_type, build_enum(e)); }
+  }
+  for k in 0..set->services.len {
+    var s: CodecPbcService* = &set->services.data[k];
+    if (s->file != fi) { continue; }
+    var sd: GrpcPbServiceDescriptorProto;
+    GrpcPbServiceDescriptorProto_init(&sd);
+    sd.has_name = true;
+    sd.name = s->name;
+    for j in 0..s->methods.len {
+      var md: CodecPbcMethod* = &s->methods.data[j];
+      var mdp: GrpcPbMethodDescriptorProto;
+      GrpcPbMethodDescriptorProto_init(&mdp);
+      mdp.has_name = true;
+      mdp.name = md->name;
+      mdp.has_input_type = true;
+      mdp.input_type = dotted(set->messages.data[md->in_ref].full);
+      mdp.has_output_type = true;
+      mdp.output_type = dotted(set->messages.data[md->out_ref].full);
+      if (md->client_stream) { mdp.has_client_streaming = true; mdp.client_streaming = true; }
+      if (md->server_stream) { mdp.has_server_streaming = true; mdp.server_streaming = true; }
+      codec_list_push(&sd.method_, mdp);
+    }
+    codec_list_push(&d.service, sd);
+  }
+  if (f->syntax == 3) {
+    d.has_syntax = true;
+    d.syntax = "proto3";
+  }
+  var w: CodecRev;
+  var bytes: string = GrpcPbFileDescriptorProto_serialize(&d, &w);
+  var n: int64 = grpc_b64_len((int64)bytes.length);
+  var p: uint8* = (uint8*)malloc(n + 1);
+  grpc_b64_encode(bytes.chars, (int64)bytes.length, p);
+  var r: string;
+  r.chars = p;
+  r.length = (uint64)n;
+  return r;
+}
+
+// Every file fi depends on, itself included, each once.
+fn closure(set: CodecPbcSet*, fi: int32, seen: bool*) {
+  if (seen[fi]) { return; }
+  seen[fi] = true;
+  var f: CodecPbcFile* = &set->files.data[fi];
+  for i in 0..f->imports.len {
+    for k in 0..set->files.len {
+      if (set->files.data[k].path == f->imports.data[i]) { closure(set, (int32)k, seen); }
+    }
+  }
+}
+
+// ---- stubs ---------------------------------------------------------------------------
+
+fn gen_grpc(set: CodecPbcSet*, fi: int32) -> string {
+  var o: Out;
+  o.text = "";
+  var f: CodecPbcFile* = &set->files.data[fi];
+  var back: string = up(f->path);
+  ln(&o, "// Generated by grpc_gen from {f->path}. Do not edit.");
+  ln(&o, "import \"std/mem\";");
+  ln(&o, "import \"codec/core/status\";");
+  ln(&o, "import \"codec/core/rev\";");
+  ln(&o, "import \"grpc/status\";");
+  ln(&o, "import \"grpc/call\";");
+  ln(&o, "import \"grpc/client\";");
+  ln(&o, "import \"grpc/server\";");
+  // The message files of every type the services use.
+  var nf: int64 = set->files.len;
+  var need: bool* = (bool*)calloc(nf, 1);
+  need[fi] = true;
+  for k in 0..set->services.len {
+    var s: CodecPbcService* = &set->services.data[k];
+    if (s->file != fi) { continue; }
+    for j in 0..s->methods.len {
+      need[set->messages.data[s->methods.data[j].in_ref].file] = true;
+      need[set->messages.data[s->methods.data[j].out_ref].file] = true;
+    }
+  }
+  for k in 0..nf {
+    if (need[k]) { ln(&o, "import \"" + back + strip_proto(set->files.data[k].path) + "_pb\";"); }
+  }
+  free(need);
+
+  // Descriptors for reflection: this file and all it depends on.
+  var seen: bool* = (bool*)calloc(nf, 1);
+  closure(set, fi, seen);
+  var ndesc: int64 = 0;
+  ln(&o, "");
+  for k in 0..nf {
+    if (seen[k]) {
+      ln(&o, "// FileDescriptorProto of " + set->files.data[k].path + ", base64.");
+      ln(&o, "const DESC_{ndesc}: string = \"" + file_descriptor_b64(set, (int32)k) + "\";");
+      ndesc = ndesc + 1;
+    }
+  }
+  free(seen);
+
+  for k in 0..set->services.len {
+    var s: CodecPbcService* = &set->services.data[k];
+    if (s->file == fi) { gen_service(set, s, &o, ndesc); }
+  }
+  return o.text;
+}
+
+fn kind_of(md: CodecPbcMethod*) -> int32 {
+  if (md->client_stream && md->server_stream) { return 3; }
+  if (md->client_stream) { return 2; }
+  if (md->server_stream) { return 1; }
+  return 0;
+}
+
+fn gen_service(set: CodecPbcSet*, s: CodecPbcService*, o: Out*, ndesc: int64) {
+  var S: string = s->mettle;
+  ln(o, "");
+  ln(o, "// ==== service {s->full} ====");
+  ln(o, "");
+  ln(o, "export const {S}_NAME: string = \"{s->full}\";");
+  ln(o, "");
+  ln(o, "// The file descriptors (base64) that describe {S}, for grpc_reflection_add.");
+  ln(o, "export fn {S}_file_descriptors(out: string*, cap: int64) -> int64 {{");
+  for i in 0..ndesc {
+    ln(o, "  if (cap > {i}) {{ out[{i}] = DESC_{i}; }");
+  }
+  ln(o, "  return {ndesc};");
+  ln(o, "}");
+
+  // Handlers.
+  ln(o, "");
+  ln(o, "// Server side: fill in the methods you serve (0 answers UNIMPLEMENTED),");
+  ln(o, "// then {S}_register. Return GRPC_PENDING to finish the call yourself later.");
+  ln(o, "export struct {S}_Handlers {{");
+  ln(o, "  user: rawptr;");
+  ln(o, "  on_cancel: fn(rawptr, GrpcCall*) -> void;");
+  for j in 0..s->methods.len {
+    var md: CodecPbcMethod* = &s->methods.data[j];
+    var I: string = set->messages.data[md->in_ref].mettle;
+    var O: string = set->messages.data[md->out_ref].mettle;
+    var k: int32 = kind_of(md);
+    if (k == 0) { ln(o, "  {md->name}: fn(rawptr, GrpcCall*, {I}*, {O}*) -> GrpcStatus;"); }
+    if (k == 1) { ln(o, "  {md->name}: fn(rawptr, GrpcCall*, {I}*) -> GrpcStatus;"); }
+    if (k == 2) {
+      ln(o, "  {md->name}: fn(rawptr, GrpcCall*, {I}*) -> void;");
+      ln(o, "  {md->name}_done: fn(rawptr, GrpcCall*, {O}*) -> GrpcStatus;");
+    }
+    if (k == 3) {
+      ln(o, "  {md->name}: fn(rawptr, GrpcCall*, {I}*) -> void;");
+      ln(o, "  {md->name}_done: fn(rawptr, GrpcCall*) -> GrpcStatus;");
+    }
+  }
+  ln(o, "}");
+  ln(o, "");
+  ln(o, "fn {S}_cancel(u: rawptr, c: GrpcCall*) {{");
+  ln(o, "  var h: {S}_Handlers* = ({S}_Handlers*)u;");
+  ln(o, "  if (h->on_cancel != 0) {{");
+  ln(o, "    h->on_cancel(h->user, c);");
+  ln(o, "  } else {{");
+  ln(o, "    grpc_srv_finish(c, grpc_status(GRPC_CANCELLED, \"\"));");
+  ln(o, "  }");
+  ln(o, "}");
+  ln(o, "");
+  ln(o, "fn {S}_end(c: GrpcCall*, st: GrpcStatus) {{");
+  ln(o, "  if (st.code != GRPC_PENDING) {{ grpc_srv_finish(c, st); }");
+  ln(o, "}");
+
+  for j in 0..s->methods.len { gen_method(set, s, &s->methods.data[j], o); }
+
+  ln(o, "");
+  ln(o, "// Adds the methods of {s->full} to a server. h must outlive the server.");
+  ln(o, "export fn {S}_register(s: GrpcServer*, h: {S}_Handlers*) {{");
+  ln(o, "  var d: GrpcMethodDesc;");
+  for j in 0..s->methods.len {
+    var md: CodecPbcMethod* = &s->methods.data[j];
+    var base: string = S + "_" + md->name;
+    ln(o, "  d = {S}_desc();");
+    ln(o, "  d.path = {base}_PATH;");
+    ln(o, "  d.kind = {kind_of(md)};");
+    ln(o, "  d.user = (rawptr)h;");
+    ln(o, "  d.on_message = &{base}_on_message;");
+    if (md->client_stream) { ln(o, "  d.on_half_close = &{base}_on_half_close;"); }
+    ln(o, "  grpc_server_add(s, &d);");
+  }
+  ln(o, "}");
+  ln(o, "");
+  ln(o, "fn {S}_desc() -> GrpcMethodDesc {{");
+  ln(o, "  var d: GrpcMethodDesc;");
+  ln(o, "  d.on_cancel = &{S}_cancel;");
+  ln(o, "  return d;");
+  ln(o, "}");
+}
+
+fn gen_method(set: CodecPbcSet*, s: CodecPbcService*, md: CodecPbcMethod*, o: Out*) {
+  var S: string = s->mettle;
+  var M: string = md->name;
+  var base: string = S + "_" + M;
+  var I: string = set->messages.data[md->in_ref].mettle;
+  var O: string = set->messages.data[md->out_ref].mettle;
+  var k: int32 = kind_of(md);
+  var kinds: string[4] = ["unary", "server streaming", "client streaming", "bidirectional streaming"];
+  ln(o, "");
+  ln(o, "// ---- rpc {M}({I}) returns ({O}), {kinds[k]} ----");
+  // {base}_PATH comes with the message file (Codec's generator).
+
+  // Client.
+  ln(o, "");
+  ln(o, "fn {base}_put(c: GrpcCall*, req: {I}*) -> int32 {{");
+  ln(o, "  var w: CodecRev;");
+  ln(o, "  var bytes: string = {I}_serialize(req, &w);");
+  ln(o, "  var rc: int32 = grpc_call_send(c, grpc_bytes(bytes));");
+  ln(o, "  codec_rev_free(&w);");
+  ln(o, "  return rc;");
+  ln(o, "}");
+  if (k == 0) {
+    ln(o, "");
+    ln(o, "// Calls {M}. resp's strings point into buf: free(buf->data) when done");
+    ln(o, "// with resp. The status owns its strings (grpc_status_free).");
+    ln(o, "export fn {base}(ch: GrpcChannel*, req: {I}*, resp: {O}*, buf: GrpcBytes*, o: GrpcCallOptions*) -> GrpcStatus {{");
+    ln(o, "  var w: CodecRev;");
+    ln(o, "  var bytes: string = {I}_serialize(req, &w);");
+    ln(o, "  var st: GrpcStatus = grpc_unary(ch, {base}_PATH, grpc_bytes(bytes), buf, o);");
+    ln(o, "  codec_rev_free(&w);");
+    ln(o, "  if (st.code == GRPC_OK && {O}_decode(resp, grpc_bytes_str(*buf)) != CODEC_OK) {{");
+    ln(o, "    st = grpc_status(GRPC_INTERNAL, \"cannot decode response\" + \"\");");
+    ln(o, "  }");
+    ln(o, "  return st;");
+    ln(o, "}");
+  } else {
+    if (k == 1) {
+      ln(o, "");
+      ln(o, "// Starts {M}: sends req and waits for responses ({base}_recv).");
+      ln(o, "export fn {base}_start(ch: GrpcChannel*, req: {I}*, o: GrpcCallOptions*) -> GrpcCall* {{");
+      ln(o, "  var c: GrpcCall* = grpc_call_start(ch, {base}_PATH, 1, o);");
+      ln(o, "  {base}_put(c, req);");
+      ln(o, "  grpc_call_close_send(c);");
+      ln(o, "  return c;");
+      ln(o, "}");
+    } else {
+      ln(o, "");
+      ln(o, "// Starts {M}. Send with {base}_write.");
+      ln(o, "export fn {base}_start(ch: GrpcChannel*, o: GrpcCallOptions*) -> GrpcCall* {{");
+      ln(o, "  return grpc_call_start(ch, {base}_PATH, {k}, o);");
+      ln(o, "}");
+      ln(o, "");
+      ln(o, "export fn {base}_write(c: GrpcCall*, req: {I}*) -> int32 {{");
+      ln(o, "  return {base}_put(c, req);");
+      ln(o, "}");
+    }
+    if (k == 2) {
+      ln(o, "");
+      ln(o, "// Ends the requests and waits for the response. resp's strings stay");
+      ln(o, "// valid until grpc_call_free(c).");
+      ln(o, "export fn {base}_finish(c: GrpcCall*, resp: {O}*) -> GrpcStatus {{");
+      ln(o, "  grpc_call_close_send(c);");
+      ln(o, "  var m: GrpcBytes;");
+      ln(o, "  var n: int32 = 0;");
+      ln(o, "  while (grpc_call_recv(c, &m)) {{");
+      ln(o, "    n = n + 1;");
+      ln(o, "    if (n == 1 && {O}_decode(resp, grpc_bytes_str(m)) != CODEC_OK) {{");
+      ln(o, "      grpc_call_cancel(c);");
+      ln(o, "      return grpc_status(GRPC_INTERNAL, \"cannot decode response\");");
+      ln(o, "    }");
+      ln(o, "  }");
+      ln(o, "  var st: GrpcStatus = grpc_call_finish(c);");
+      ln(o, "  if (st.code == GRPC_OK && n != 1) {{ st = grpc_status(GRPC_INTERNAL, \"expected one response\"); }");
+      ln(o, "  return st;");
+      ln(o, "}");
+    } else {
+      ln(o, "");
+      ln(o, "// The next response, or false at the end (then grpc_call_finish).");
+      ln(o, "// Init resp once before the first call; its strings stay valid until");
+      ln(o, "// the next recv.");
+      ln(o, "export fn {base}_recv(c: GrpcCall*, resp: {O}*) -> bool {{");
+      ln(o, "  var m: GrpcBytes;");
+      ln(o, "  if (!grpc_call_recv(c, &m)) {{ return false; }");
+      ln(o, "  {O}_free(resp);");
+      ln(o, "  {O}_init(resp);");
+      ln(o, "  if ({O}_decode(resp, grpc_bytes_str(m)) != CODEC_OK) {{");
+      ln(o, "    grpc_call_cancel(c);");
+      ln(o, "    return false;");
+      ln(o, "  }");
+      ln(o, "  return true;");
+      ln(o, "}");
+    }
+  }
+
+  // Server.
+  ln(o, "");
+  ln(o, "// Server: sends one response on c.");
+  ln(o, "export fn {base}_reply(c: GrpcCall*, resp: {O}*) -> int32 {{");
+  ln(o, "  var w: CodecRev;");
+  ln(o, "  var bytes: string = {O}_serialize(resp, &w);");
+  ln(o, "  var rc: int32 = grpc_srv_send(c, grpc_bytes(bytes));");
+  ln(o, "  codec_rev_free(&w);");
+  ln(o, "  return rc;");
+  ln(o, "}");
+  ln(o, "");
+  ln(o, "fn {base}_on_message(u: rawptr, c: GrpcCall*, m: GrpcBytes*) {{");
+  ln(o, "  var h: {S}_Handlers* = ({S}_Handlers*)u;");
+  ln(o, "  if (h->{M} == 0) {{");
+  ln(o, "    grpc_srv_finish(c, grpc_status(GRPC_UNIMPLEMENTED, \"{M} not implemented\"));");
+  ln(o, "    return;");
+  ln(o, "  }");
+  ln(o, "  var req: {I};");
+  ln(o, "  {I}_init(&req);");
+  ln(o, "  if ({I}_decode(&req, grpc_bytes_str(*m)) != CODEC_OK) {{");
+  ln(o, "    {I}_free(&req);");
+  ln(o, "    grpc_srv_finish(c, grpc_status(GRPC_INTERNAL, \"cannot decode request\"));");
+  ln(o, "    return;");
+  ln(o, "  }");
+  if (k == 0) {
+    ln(o, "  var resp: {O};");
+    ln(o, "  {O}_init(&resp);");
+    ln(o, "  var st: GrpcStatus = h->{M}(h->user, c, &req, &resp);");
+    ln(o, "  if (st.code == GRPC_OK) {{ {base}_reply(c, &resp); }");
+    ln(o, "  {S}_end(c, st);");
+    ln(o, "  {O}_free(&resp);");
+  }
+  if (k == 1) {
+    ln(o, "  {S}_end(c, h->{M}(h->user, c, &req));");
+  }
+  if (k >= 2) {
+    ln(o, "  h->{M}(h->user, c, &req);");
+  }
+  ln(o, "  {I}_free(&req);");
+  ln(o, "}");
+  if (k == 2) {
+    ln(o, "");
+    ln(o, "fn {base}_on_half_close(u: rawptr, c: GrpcCall*) {{");
+    ln(o, "  var h: {S}_Handlers* = ({S}_Handlers*)u;");
+    ln(o, "  if (h->{M}_done == 0) {{");
+    ln(o, "    grpc_srv_finish(c, grpc_status(GRPC_UNIMPLEMENTED, \"{M} not implemented\"));");
+    ln(o, "    return;");
+    ln(o, "  }");
+    ln(o, "  var resp: {O};");
+    ln(o, "  {O}_init(&resp);");
+    ln(o, "  var st: GrpcStatus = h->{M}_done(h->user, c, &resp);");
+    ln(o, "  if (st.code == GRPC_OK) {{ {base}_reply(c, &resp); }");
+    ln(o, "  {S}_end(c, st);");
+    ln(o, "  {O}_free(&resp);");
+    ln(o, "}");
+  }
+  if (k == 3) {
+    ln(o, "");
+    ln(o, "fn {base}_on_half_close(u: rawptr, c: GrpcCall*) {{");
+    ln(o, "  var h: {S}_Handlers* = ({S}_Handlers*)u;");
+    ln(o, "  if (h->{M}_done == 0) {{");
+    ln(o, "    grpc_srv_finish(c, grpc_status(GRPC_OK, \"\"));");
+    ln(o, "    return;");
+    ln(o, "  }");
+    ln(o, "  {S}_end(c, h->{M}_done(h->user, c));");
+    ln(o, "}");
+  }
+}
+
+fn main(argc: int32, argv: cstring*) -> int32 {
+  var set: CodecPbcSet;
+  set.prefix = "";
+  var out: string = ".";
+  var with_pb: bool = true;
+  var names: CodecList<string>;
+  var i: int32 = 1;
+  while (i < argc) {
+    var a: string = str_of(argv[i]);
+    if ((a == "-I" || a == "--out" || a == "--prefix") && i + 1 < argc) {
+      var v: string = str_of(argv[i + 1]);
+      if (a == "-I") { codec_list_push(&set.include, v); }
+      if (a == "--out") { out = v; }
+      if (a == "--prefix") { set.prefix = v; }
+      i = i + 2;
+      continue;
+    }
+    if (a == "--no-pb") {
+      with_pb = false;
+    } else if (a.length > 2 && a.chars[0] == 45 && a.chars[1] == 73) {
+      var dir: string;
+      dir.chars = a.chars + 2;
+      dir.length = a.length - 2;
+      codec_list_push(&set.include, dir);
+    } else if (a.length > 0 && a.chars[0] == 45) {
+      return usage();
+    } else {
+      codec_list_push(&names, a);
+    }
+    i = i + 1;
+  }
+  if (names.len == 0) { return usage(); }
+  if (set.include.len == 0) { codec_list_push(&set.include, "."); }
+  for k in 0..names.len {
+    if (codec_pbc_load(&set, names.data[k]) < 0) {
+      print_err(set.error + "\n");
+      return 1;
+    }
+  }
+  if (!codec_pbc_resolve(&set)) {
+    print_err(set.error + "\n");
+    return 1;
+  }
+  for f in 0..set.files.len {
+    var fpath: string = set.files.data[f].path;
+    if (with_pb) {
+      var path: string = out + "/" + codec_pbc_out_name(fpath);
+      if (!write_file(path, codec_pbc_generate(&set, (int32)f, "codec"))) {
+        print_err("cannot write " + path + "\n");
+        return 1;
+      }
+    }
+    var has_service: bool = false;
+    for s in 0..set.services.len {
+      if (set.services.data[s].file == (int32)f) { has_service = true; }
+    }
+    if (has_service) {
+      var gpath: string = out + "/" + strip_proto(fpath) + "_grpc.mettle";
+      if (!write_file(gpath, gen_grpc(&set, (int32)f))) {
+        print_err("cannot write " + gpath + "\n");
+        return 1;
+      }
+    }
+  }
+  return 0;
+}

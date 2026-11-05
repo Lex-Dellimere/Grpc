@@ -1,0 +1,30 @@
+syntax = "proto3";
+
+package test.echo;
+
+import "google/protobuf/duration.proto";
+
+message EchoRequest {
+  string text = 1;
+  int32 repeat = 2;
+  google.protobuf.Duration delay = 3;
+  enum Mode {
+    MODE_PLAIN = 0;
+    MODE_UPPER = 1;
+  }
+  Mode mode = 4;
+  optional string tag = 5;
+  map<string, int32> counts = 6;
+}
+
+message EchoReply {
+  string text = 1;
+  int32 index = 2;
+}
+
+service Echo {
+  rpc Say(EchoRequest) returns (EchoReply);
+  rpc Expand(EchoRequest) returns (stream EchoReply);
+  rpc Collect(stream EchoRequest) returns (EchoReply);
+  rpc Chat(stream EchoRequest) returns (stream EchoReply);
+}

@@ -1,0 +1,175 @@
+// The generated stubs (tests/gen, from tests/proto/echo.proto) for all four
+// call kinds over the in-memory transport.
+import "grpc/grpc";
+import "gen/echo_grpc";
+import "tutil";
+import "std/mem";
+
+struct State {
+  collected: int32;
+  chars: int64;
+}
+
+fn say(u: rawptr, c: GrpcCall*, req: TEchoRequest*, resp: TEchoReply*) -> GrpcStatus {
+  if (req->text == "missing") { return grpc_status(GRPC_NOT_FOUND, "no such text"); }
+  resp->text = req->text;
+  resp->index = req->repeat;
+  if (req->has_tag) { resp->index = resp->index + 1000; }
+  return grpc_status(GRPC_OK, "");
+}
+
+fn expand(u: rawptr, c: GrpcCall*, req: TEchoRequest*) -> GrpcStatus {
+  for i in 0..req->repeat {
+    var r: TEchoReply;
+    TEchoReply_init(&r);
+    r.text = req->text;
+    r.index = (int32)i;
+    TEcho_Expand_reply(c, &r);
+  }
+  return grpc_status(GRPC_OK, "");
+}
+
+fn collect(u: rawptr, c: GrpcCall*, req: TEchoRequest*) {
+  var s: State* = (State*)u;
+  s->collected = s->collected + 1;
+  s->chars = s->chars + (int64)req->text.length;
+}
+
+fn collect_done(u: rawptr, c: GrpcCall*, resp: TEchoReply*) -> GrpcStatus {
+  var s: State* = (State*)u;
+  resp->index = s->collected;
+  resp->text = "chars";
+  return grpc_status(GRPC_OK, "");
+}
+
+fn chat(u: rawptr, c: GrpcCall*, req: TEchoRequest*) {
+  var r: TEchoReply;
+  TEchoReply_init(&r);
+  r.text = req->text;
+  r.index = (int32)req->counts.len;
+  TEcho_Chat_reply(c, &r);
+}
+
+fn idle_server(u: rawptr) {
+  grpc_server_conn_poll((GrpcServerConn*)u);
+}
+
+fn main() -> int32 {
+  var state: State;
+  var h: TEcho_Handlers;
+  h.user = (rawptr)&state;
+  h.Say = &say;
+  h.Expand = &expand;
+  h.Collect = &collect;
+  h.Collect_done = &collect_done;
+  h.Chat = &chat;
+  var sopts: GrpcServerOptions;
+  var srv: GrpcServer;
+  grpc_server_init(&srv, &sopts);
+  TEcho_register(&srv, &h);
+
+  var pipe: GrpcMemPipe;
+  grpc_mem_pipe_init(&pipe);
+  var sc: GrpcServerConn;
+  grpc_server_conn_init(&sc, &srv, grpc_mem_transport(&pipe.server));
+  pipe.client.idle = &idle_server;
+  pipe.client.idle_user = (rawptr)&sc;
+  var copts: GrpcChannelOptions;
+  var ch: GrpcChannel;
+  grpc_channel_init(&ch, grpc_mem_transport(&pipe.client), &copts);
+  var o: GrpcCallOptions = grpc_call_options();
+
+  // Unary.
+  var req: TEchoRequest;
+  TEchoRequest_init(&req);
+  req.text = "hello";
+  req.repeat = 7;
+  req.has_tag = true;
+  req.tag = "t";
+  var resp: TEchoReply;
+  TEchoReply_init(&resp);
+  var buf: GrpcBytes;
+  var st: GrpcStatus = TEcho_Say(&ch, &req, &resp, &buf, &o);
+  t_eq("say ok", st.code, GRPC_OK);
+  t_str("say text", resp.text, "hello");
+  t_eq("say index", resp.index, 1007);
+  free(buf.data);
+  TEchoReply_free(&resp);
+  req.text = "missing";
+  TEchoReply_init(&resp);
+  st = TEcho_Say(&ch, &req, &resp, &buf, &o);
+  t_eq("say not found", st.code, GRPC_NOT_FOUND);
+  t_str("say message", st.message, "no such text");
+  grpc_status_free(&st);
+
+  // Server streaming.
+  req.text = "x";
+  req.repeat = 12;
+  var c: GrpcCall* = TEcho_Expand_start(&ch, &req, &o);
+  TEchoReply_init(&resp);
+  var n: int32 = 0;
+  var order: bool = true;
+  while (TEcho_Expand_recv(c, &resp)) {
+    if (resp.index != n || resp.text != "x") { order = false; }
+    n = n + 1;
+  }
+  t_eq("expand count", n, 12);
+  t_ok("expand order", order);
+  t_eq("expand ok", grpc_call_finish(c).code, GRPC_OK);
+  TEchoReply_free(&resp);
+  grpc_call_free(c);
+
+  // Client streaming.
+  c = TEcho_Collect_start(&ch, &o);
+  for i in 0..9 {
+    req.text = "abc";
+    TEcho_Collect_write(c, &req);
+  }
+  TEchoReply_init(&resp);
+  st = TEcho_Collect_finish(c, &resp);
+  t_eq("collect ok", st.code, GRPC_OK);
+  t_eq("collect count", resp.index, 9);
+  t_eq("collect chars", state.chars, 27);
+  TEchoReply_free(&resp);
+  grpc_call_free(c);
+
+  // Bidirectional, with a map field.
+  c = TEcho_Chat_start(&ch, &o);
+  var e: TEchoRequest_CountsEntry;
+  TEchoRequest_CountsEntry_init(&e);
+  e.key = "k";
+  e.value = 1;
+  codec_list_push(&req.counts, e);
+  e.key = "j";
+  codec_list_push(&req.counts, e);
+  TEchoReply_init(&resp);
+  var chat_ok: bool = true;
+  for i in 0..5 {
+    req.text = "m{i}";
+    TEcho_Chat_write(c, &req);
+    if (!TEcho_Chat_recv(c, &resp) || resp.text != req.text || resp.index != 2) { chat_ok = false; }
+  }
+  t_ok("chat", chat_ok);
+  grpc_call_close_send(c);
+  t_ok("chat end", !TEcho_Chat_recv(c, &resp));
+  t_eq("chat ok", grpc_call_finish(c).code, GRPC_OK);
+  TEchoReply_free(&resp);
+  grpc_call_free(c);
+
+  // A method left 0 in the handlers answers UNIMPLEMENTED.
+  h.Say = (fn(rawptr, GrpcCall*, TEchoRequest*, TEchoReply*) -> GrpcStatus)0;
+  TEchoReply_init(&resp);
+  st = TEcho_Say(&ch, &req, &resp, &buf, &o);
+  t_eq("unimplemented", st.code, GRPC_UNIMPLEMENTED);
+
+  // Descriptors for reflection.
+  var ds: string[4];
+  t_eq("descriptors", TEcho_file_descriptors(&ds[0], 4), 2);
+  t_ok("descriptor text", ds[0].length > 100);
+
+  grpc_channel_close(&ch);
+  grpc_server_conn_free(&sc);
+  grpc_mem_pipe_free(&pipe);
+  grpc_server_free(&srv);
+  return t_done("codegen");
+}

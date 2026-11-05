@@ -33,11 +33,25 @@ export struct GrpcStatus {
   details: string;
 }
 
+// A handler may return this instead of a status to say it will finish the
+// call itself later (grpc_srv_finish).
+export const GRPC_PENDING = -1;
+
 export fn grpc_status(code: int32, message: string) -> GrpcStatus {
   var s: GrpcStatus;
   s.code = code;
   s.message = message;
   return s;
+}
+
+// Frees the message and details of a status that owns them: the ones
+// grpc_unary and the generated unary stubs return.
+export fn grpc_status_free(s: GrpcStatus*) {
+  if (s->message.length > 0) { free(s->message.chars); }
+  if (s->details.length > 0) { free(s->details.chars); }
+  var z: string;
+  s->message = z;
+  s->details = z;
 }
 
 export fn grpc_status_ok(s: GrpcStatus*) -> bool {
