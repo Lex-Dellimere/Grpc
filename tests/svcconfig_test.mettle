@@ -1,0 +1,439 @@
+// The service config: parsing and validation, lookup order, durations,
+// retry backoff, the throttle, and pushback.
+// JSON in this file is written with ' for " (see q) to keep it readable.
+import "grpc/svcconfig";
+import "grpc/status";
+import "grpc/json";
+import "tutil";
+import "std/arena";
+
+// Turns every ' into ".
+fn q(a: Arena*, s: string) -> string {
+  var p: uint8* = (uint8*)arena_alloc(a, (int64)s.length + 1);
+  for i in 0..(int64)s.length {
+    var c: uint8 = s.chars[i];
+    if (c == 39) { c = 34; }
+    p[i] = c;
+  }
+  var r: string;
+  r.chars = p;
+  r.length = s.length;
+  return r;
+}
+
+fn parse(a: Arena*, text: string, c: GrpcServiceConfig*) -> string {
+  return grpc_svc_config_parse(a, q(a, text), c);
+}
+
+// A config with one method, wrapped around the given methodConfig body.
+fn one(a: Arena*, body: string) -> string {
+  var c: GrpcServiceConfig;
+  return parse(a, "{{'methodConfig': [{{'name': [{{'service': 's'}], " + body + "}]}", &c);
+}
+
+fn rejects(a: Arena*, name: string, text: string) {
+  var c: GrpcServiceConfig;
+  var e: string = parse(a, text, &c);
+  t_ok(name, e != "");
+}
+
+fn rejects_one(a: Arena*, name: string, body: string) {
+  t_ok(name, one(a, body) != "");
+}
+
+fn accepts_one(a: Arena*, name: string, body: string) {
+  var e: string = one(a, body);
+  t_str(name, e, "");
+}
+
+fn near(name: string, got: int64, want: int64) {
+  var d: int64 = got - want;
+  if (d < 0) { d = -d; }
+  t_ok(name, d <= 1);
+}
+
+fn mask(c0: int32, c1: int32, c2: int32) -> uint32 {
+  var m: uint32 = 0;
+  m = m | ((uint32)1 << c0);
+  if (c1 >= 0) { m = m | ((uint32)1 << c1); }
+  if (c2 >= 0) { m = m | ((uint32)1 << c2); }
+  return m;
+}
+
+const FULL: string = "{{ 'methodConfig': [ {{ 'name': [{{'service': 'pkg.Echo', 'method': 'Say'}], 'waitForReady': true, 'timeout': '1.5s', 'maxRequestMessageBytes': 1024, 'maxResponseMessageBytes': '2048', 'retryPolicy': {{ 'maxAttempts': 4, 'initialBackoff': '0.1s', 'maxBackoff': '1s', 'backoffMultiplier': 2, 'retryableStatusCodes': ['UNAVAILABLE', 'aborted', 4] } }, {{ 'name': [{{'service': 'pkg.Echo'}], 'timeout': '10s', 'hedgingPolicy': {{ 'maxAttempts': 9, 'hedgingDelay': '0.2s', 'nonFatalStatusCodes': ['UNAVAILABLE', 'INTERNAL'] } }, {{ 'name': [{{}], 'timeout': '30s', 'futureKey': [1, 2, {{'x': null}], 'waitForReady': false }, {{ 'name': [{{'service': 'other.Svc', 'method': ''}, {{'service': 'x.Y', 'method': 'Z'}], 'retryPolicy': {{ 'maxAttempts': 2, 'initialBackoff': '1s', 'maxBackoff': '2s', 'backoffMultiplier': 1.5, 'retryableStatusCodes': [0] } } ], 'retryThrottling': {{'maxTokens': 10, 'tokenRatio': 0.1}, 'loadBalancingConfig': [{{'round_robin': {{}}, {{'pick_first': {{}}], 'somethingNew': {{'a': [true]} }";
+
+fn main() -> int32 {
+  var a: Arena* = arena_init(0);
+  var c: GrpcServiceConfig;
+
+  // ---- a full config ----
+  t_str("full parses", parse(a, FULL, &c), "");
+  t_eq("nmethods", c.nmethods, 4);
+  t_str("lb", c.lb_policy, "round_robin");
+  t_ok("throttle set", c.has_throttle);
+  t_ok("max tokens", c.max_tokens == 10.0);
+  t_ok("token ratio", c.token_ratio == 0.1);
+  var m0: GrpcMethodConfig* = &c.methods[0];
+  t_eq("m0 names", m0->nnames, 1);
+  t_str("m0 service", m0->names[0].service, "pkg.Echo");
+  t_str("m0 method", m0->names[0].method_name, "Say");
+  t_eq("m0 wfr", m0->wait_for_ready, 1);
+  t_eq("m0 timeout", m0->timeout_ns, 1500000000);
+  t_eq("m0 max req", m0->max_request_bytes, 1024);
+  t_eq("m0 max resp", m0->max_response_bytes, 2048);
+  t_ok("m0 retry", m0->has_retry && !m0->has_hedging);
+  t_eq("m0 attempts", m0->retry.max_attempts, 4);
+  t_eq("m0 initial", m0->retry.initial_backoff_ns, 100000000);
+  t_eq("m0 max backoff", m0->retry.max_backoff_ns, 1000000000);
+  t_ok("m0 multiplier", m0->retry.multiplier == 2.0);
+  t_eq("m0 codes", (int64)m0->retry.codes, (int64)mask(GRPC_UNAVAILABLE, GRPC_ABORTED, GRPC_DEADLINE_EXCEEDED));
+  t_ok("code in", grpc_code_in(m0->retry.codes, GRPC_UNAVAILABLE));
+  t_ok("code in aborted", grpc_code_in(m0->retry.codes, GRPC_ABORTED));
+  t_ok("code in deadline", grpc_code_in(m0->retry.codes, GRPC_DEADLINE_EXCEEDED));
+  t_ok("code not in", !grpc_code_in(m0->retry.codes, GRPC_INTERNAL));
+  t_ok("code not in ok", !grpc_code_in(m0->retry.codes, GRPC_OK));
+  t_ok("code range low", !grpc_code_in(m0->retry.codes, -1));
+  t_ok("code range high", !grpc_code_in(m0->retry.codes, 32));
+  t_ok("code 31", grpc_code_in(0x80000000, 31));
+  var m1: GrpcMethodConfig* = &c.methods[1];
+  t_eq("m1 wfr unset", m1->wait_for_ready, -1);
+  t_eq("m1 timeout", m1->timeout_ns, 10000000000);
+  t_eq("m1 max req unset", m1->max_request_bytes, 0);
+  t_ok("m1 hedging", m1->has_hedging && !m1->has_retry);
+  t_eq("m1 attempts capped", m1->hedging.max_attempts, 5);
+  t_eq("m1 delay", m1->hedging.delay_ns, 200000000);
+  t_eq("m1 non fatal", (int64)m1->hedging.non_fatal, (int64)mask(GRPC_UNAVAILABLE, GRPC_INTERNAL, -1));
+  var m2: GrpcMethodConfig* = &c.methods[2];
+  t_eq("m2 names", m2->nnames, 1);
+  t_eq("m2 service empty", (int64)m2->names[0].service.length, 0);
+  t_eq("m2 method empty", (int64)m2->names[0].method_name.length, 0);
+  t_eq("m2 wfr false", m2->wait_for_ready, 0);
+  t_eq("m2 timeout", m2->timeout_ns, 30000000000);
+  t_ok("m2 no policies", !m2->has_retry && !m2->has_hedging);
+  var m3: GrpcMethodConfig* = &c.methods[3];
+  t_eq("m3 names", m3->nnames, 2);
+  t_eq("m3 codes ok", (int64)m3->retry.codes, 1);
+  t_ok("m3 multiplier", m3->retry.multiplier == 1.5);
+  t_eq("m3 attempts", m3->retry.max_attempts, 2);
+
+  // ---- lookup order ----
+  t_ok("find exact", grpc_svc_config_find(&c, "/pkg.Echo/Say") == m0);
+  t_ok("find service", grpc_svc_config_find(&c, "/pkg.Echo/Other") == m1);
+  t_ok("find service, empty method", grpc_svc_config_find(&c, "/pkg.Echo/") == m1);
+  t_ok("find default", grpc_svc_config_find(&c, "/zzz.Q/Say") == m2);
+  t_ok("find other service", grpc_svc_config_find(&c, "/other.Svc/Any") == m3);
+  t_ok("find second name", grpc_svc_config_find(&c, "/x.Y/Z") == m3);
+  t_ok("second name's other method", grpc_svc_config_find(&c, "/x.Y/W") == m2);
+  t_ok("prefix is not a match", grpc_svc_config_find(&c, "/pkg.Ech/Say") == m2);
+  t_ok("longer is not a match", grpc_svc_config_find(&c, "/pkg.Echo2/Say") == m2);
+  t_ok("path no leading slash", grpc_svc_config_find(&c, "pkg.Echo/Say") == m2);
+  t_ok("path one slash", grpc_svc_config_find(&c, "/pkg.Echo") == m2);
+  t_ok("path empty", grpc_svc_config_find(&c, "") == m2);
+  t_ok("path slash", grpc_svc_config_find(&c, "/") == m2);
+  t_ok("path double slash", grpc_svc_config_find(&c, "//") == m2);
+
+  // Order in the file does not matter: exact beats service beats default.
+  var c2: GrpcServiceConfig;
+  t_str("order parses", parse(a, "{{'methodConfig': [{{'name': [{{}], 'timeout': '1s'}, {{'name': [{{'service': 'a.B'}], 'timeout': '2s'}, {{'name': [{{'service': 'a.B', 'method': 'm'}], 'timeout': '3s'}]}", &c2), "");
+  t_eq("order exact", grpc_svc_config_find(&c2, "/a.B/m")->timeout_ns, 3000000000);
+  t_eq("order service", grpc_svc_config_find(&c2, "/a.B/n")->timeout_ns, 2000000000);
+  t_eq("order default", grpc_svc_config_find(&c2, "/a.C/m")->timeout_ns, 1000000000);
+  // No default entry: nothing matches an unlisted method.
+  t_str("no default parses", parse(a, "{{'methodConfig': [{{'name': [{{'service': 'a.B'}], 'timeout': '2s'}]}", &c2), "");
+  t_ok("no default none", grpc_svc_config_find(&c2, "/a.C/m") == 0);
+  t_ok("no default service", grpc_svc_config_find(&c2, "/a.B/m") != 0);
+  t_str("empty config", parse(a, "{{}", &c2), "");
+  t_eq("empty config methods", c2.nmethods, 0);
+  t_str("empty config lb", c2.lb_policy, "pick_first");
+  t_ok("empty config throttle", !c2.has_throttle);
+  t_ok("empty config find", grpc_svc_config_find(&c2, "/a.B/m") == 0);
+  t_str("empty methodConfig", parse(a, "{{'methodConfig': []}", &c2), "");
+  t_ok("empty methodConfig find", grpc_svc_config_find(&c2, "/a.B/m") == 0);
+
+  // ---- load balancing and throttle settings ----
+  t_str("legacy lb", parse(a, "{{'loadBalancingPolicy': 'ROUND_ROBIN'}", &c2), "");
+  t_str("legacy lb lowered", c2.lb_policy, "round_robin");
+  t_str("lb config wins", parse(a, "{{'loadBalancingPolicy': 'pick_first', 'loadBalancingConfig': [{{'grpclb': {{'childPolicy': []}}]}", &c2), "");
+  t_str("lb config wins value", c2.lb_policy, "grpclb");
+  rejects(a, "lb config empty", "{{'loadBalancingConfig': []}");
+  rejects(a, "lb config not array", "{{'loadBalancingConfig': {{}}");
+  rejects(a, "lb config entry two keys", "{{'loadBalancingConfig': [{{'a': {{}, 'b': {{}}]}");
+  rejects(a, "lb config entry not object", "{{'loadBalancingConfig': ['a']}");
+  rejects(a, "lb legacy empty", "{{'loadBalancingPolicy': ''}");
+  rejects(a, "lb legacy not string", "{{'loadBalancingPolicy': 3}");
+
+  t_str("throttle 1000", parse(a, "{{'retryThrottling': {{'maxTokens': 1000, 'tokenRatio': 1}}", &c2), "");
+  t_ok("throttle 1000 set", c2.has_throttle && c2.max_tokens == 1000.0 && c2.token_ratio == 1.0);
+  t_str("ratio truncated", parse(a, "{{'retryThrottling': {{'maxTokens': 6, 'tokenRatio': 0.5555}}", &c2), "");
+  t_ok("ratio 0.555", c2.token_ratio == 0.555);
+  t_str("ratio truncated low", parse(a, "{{'retryThrottling': {{'maxTokens': 6, 'tokenRatio': 0.0019}}", &c2), "");
+  t_ok("ratio 0.001", c2.token_ratio == 0.001);
+  t_str("ratio 0.57", parse(a, "{{'retryThrottling': {{'maxTokens': 6, 'tokenRatio': 0.57}}", &c2), "");
+  t_ok("ratio 0.57 kept", c2.token_ratio == 0.57);
+  t_str("ratio big", parse(a, "{{'retryThrottling': {{'maxTokens': 0.5, 'tokenRatio': 100}}", &c2), "");
+  t_ok("ratio big kept", c2.token_ratio == 100.0 && c2.max_tokens == 0.5);
+  rejects(a, "throttle max 0", "{{'retryThrottling': {{'maxTokens': 0, 'tokenRatio': 1}}");
+  rejects(a, "throttle max negative", "{{'retryThrottling': {{'maxTokens': -1, 'tokenRatio': 1}}");
+  rejects(a, "throttle max 1001", "{{'retryThrottling': {{'maxTokens': 1001, 'tokenRatio': 1}}");
+  rejects(a, "throttle max string", "{{'retryThrottling': {{'maxTokens': '10', 'tokenRatio': 1}}");
+  rejects(a, "throttle max missing", "{{'retryThrottling': {{'tokenRatio': 1}}");
+  rejects(a, "throttle ratio missing", "{{'retryThrottling': {{'maxTokens': 10}}");
+  rejects(a, "throttle ratio 0", "{{'retryThrottling': {{'maxTokens': 10, 'tokenRatio': 0}}");
+  rejects(a, "throttle ratio negative", "{{'retryThrottling': {{'maxTokens': 10, 'tokenRatio': -0.1}}");
+  rejects(a, "throttle ratio under 0.001", "{{'retryThrottling': {{'maxTokens': 10, 'tokenRatio': 0.0004}}");
+  rejects(a, "throttle not object", "{{'retryThrottling': 3}");
+
+  // ---- structure ----
+  rejects(a, "bad json", "{{");
+  rejects(a, "json trailing", "{{} x");
+  rejects(a, "top level array", "[]");
+  rejects(a, "top level string", "'x'");
+  rejects(a, "methodConfig not array", "{{'methodConfig': {{}}");
+  rejects(a, "methodConfig entry not object", "{{'methodConfig': [1]}");
+  rejects(a, "name missing", "{{'methodConfig': [{{'timeout': '1s'}]}");
+  rejects(a, "name empty", "{{'methodConfig': [{{'name': []}]}");
+  rejects(a, "name not array", "{{'methodConfig': [{{'name': {{}}]}");
+  rejects(a, "name entry not object", "{{'methodConfig': [{{'name': ['a']}]}");
+  rejects(a, "method without service", "{{'methodConfig': [{{'name': [{{'method': 'M'}]}]}");
+  rejects(a, "method with empty service", "{{'methodConfig': [{{'name': [{{'service': '', 'method': 'M'}]}]}");
+  rejects(a, "service not string", "{{'methodConfig': [{{'name': [{{'service': 1}]}]}");
+  rejects(a, "method not string", "{{'methodConfig': [{{'name': [{{'service': 'a', 'method': true}]}]}");
+  rejects(a, "duplicate across configs", "{{'methodConfig': [{{'name': [{{'service': 'a'}]}, {{'name': [{{'service': 'a'}]}]}");
+  rejects(a, "duplicate method across configs", "{{'methodConfig': [{{'name': [{{'service': 'a', 'method': 'm'}]}, {{'name': [{{'service': 'b'}, {{'service': 'a', 'method': 'm'}]}]}");
+  rejects(a, "duplicate in one config", "{{'methodConfig': [{{'name': [{{'service': 'a'}, {{'service': 'a'}]}]}");
+  rejects(a, "duplicate default", "{{'methodConfig': [{{'name': [{{}]}, {{'name': [{{}]}]}");
+  rejects(a, "duplicate empty method", "{{'methodConfig': [{{'name': [{{'service': 'a'}, {{'service': 'a', 'method': ''}]}]}");
+  t_str("same service, different methods", one(a, "'timeout': '1s'"), "");
+  var c3: GrpcServiceConfig;
+  t_str("different methods ok", parse(a, "{{'methodConfig': [{{'name': [{{'service': 'a', 'method': 'm'}]}, {{'name': [{{'service': 'a', 'method': 'n'}, {{'service': 'a'}, {{}]}]}", &c3), "");
+  t_eq("different methods count", c3.nmethods, 2);
+
+  // ---- method fields ----
+  accepts_one(a, "wfr true", "'waitForReady': true");
+  rejects_one(a, "wfr string", "'waitForReady': 'true'");
+  rejects_one(a, "wfr number", "'waitForReady': 1");
+  accepts_one(a, "timeout ok", "'timeout': '3s'");
+  rejects_one(a, "timeout no unit", "'timeout': '3'");
+  rejects_one(a, "timeout negative", "'timeout': '-1s'");
+  rejects_one(a, "timeout number", "'timeout': 5");
+  rejects_one(a, "timeout garbage", "'timeout': 'soon'");
+  accepts_one(a, "max req string", "'maxRequestMessageBytes': '9223372036854775807'");
+  accepts_one(a, "max resp zero", "'maxResponseMessageBytes': 0");
+  rejects_one(a, "max req negative", "'maxRequestMessageBytes': -1");
+  rejects_one(a, "max req negative string", "'maxRequestMessageBytes': '-1'");
+  rejects_one(a, "max req fraction", "'maxRequestMessageBytes': 1.5");
+  rejects_one(a, "max req junk string", "'maxRequestMessageBytes': 'abc'");
+  rejects_one(a, "max req empty string", "'maxRequestMessageBytes': ''");
+  rejects_one(a, "max req overflow string", "'maxRequestMessageBytes': '9223372036854775808'");
+  rejects_one(a, "max req huge", "'maxRequestMessageBytes': 1e30");
+  rejects_one(a, "max resp bool", "'maxResponseMessageBytes': true");
+  var c4: GrpcServiceConfig;
+  t_str("limits parse", parse(a, "{{'methodConfig': [{{'name': [{{'service': 'a'}], 'maxRequestMessageBytes': 4194304, 'maxResponseMessageBytes': '9223372036854775807'}]}", &c4), "");
+  t_eq("limit number", c4.methods[0].max_request_bytes, 4194304);
+  t_eq("limit string", c4.methods[0].max_response_bytes, 9223372036854775807);
+
+  // ---- retry policy ----
+  var retry_ok: string = "'retryPolicy': {{'maxAttempts': 3, 'initialBackoff': '1s', 'maxBackoff': '5s', 'backoffMultiplier': 2, 'retryableStatusCodes': ['UNAVAILABLE']}";
+  accepts_one(a, "retry ok", retry_ok);
+  var rp: string = "'retryPolicy': {{";
+  var good_attempts: string = "'maxAttempts': 3, ";
+  var good_init: string = "'initialBackoff': '1s', ";
+  var good_max: string = "'maxBackoff': '5s', ";
+  var good_mult: string = "'backoffMultiplier': 2, ";
+  var good_codes: string = "'retryableStatusCodes': ['UNAVAILABLE']";
+  accepts_one(a, "retry parts ok", rp + good_attempts + good_init + good_max + good_mult + good_codes + "}");
+  rejects_one(a, "retry attempts 1", rp + "'maxAttempts': 1, " + good_init + good_max + good_mult + good_codes + "}");
+  rejects_one(a, "retry attempts 0", rp + "'maxAttempts': 0, " + good_init + good_max + good_mult + good_codes + "}");
+  rejects_one(a, "retry attempts missing", rp + good_init + good_max + good_mult + good_codes + "}");
+  rejects_one(a, "retry attempts fraction", rp + "'maxAttempts': 2.5, " + good_init + good_max + good_mult + good_codes + "}");
+  rejects_one(a, "retry attempts junk", rp + "'maxAttempts': 'many', " + good_init + good_max + good_mult + good_codes + "}");
+  accepts_one(a, "retry attempts string", rp + "'maxAttempts': '4', " + good_init + good_max + good_mult + good_codes + "}");
+  rejects_one(a, "retry initial 0", rp + good_attempts + "'initialBackoff': '0s', " + good_max + good_mult + good_codes + "}");
+  rejects_one(a, "retry initial missing", rp + good_attempts + good_max + good_mult + good_codes + "}");
+  rejects_one(a, "retry initial bad", rp + good_attempts + "'initialBackoff': '1', " + good_max + good_mult + good_codes + "}");
+  rejects_one(a, "retry initial number", rp + good_attempts + "'initialBackoff': 1, " + good_max + good_mult + good_codes + "}");
+  rejects_one(a, "retry max 0", rp + good_attempts + good_init + "'maxBackoff': '0s', " + good_mult + good_codes + "}");
+  rejects_one(a, "retry max negative", rp + good_attempts + good_init + "'maxBackoff': '-1s', " + good_mult + good_codes + "}");
+  rejects_one(a, "retry max missing", rp + good_attempts + good_init + good_mult + good_codes + "}");
+  rejects_one(a, "retry mult 0", rp + good_attempts + good_init + good_max + "'backoffMultiplier': 0, " + good_codes + "}");
+  rejects_one(a, "retry mult negative", rp + good_attempts + good_init + good_max + "'backoffMultiplier': -2, " + good_codes + "}");
+  rejects_one(a, "retry mult string", rp + good_attempts + good_init + good_max + "'backoffMultiplier': '2', " + good_codes + "}");
+  rejects_one(a, "retry mult missing", rp + good_attempts + good_init + good_max + good_codes + "}");
+  accepts_one(a, "retry mult below 1", rp + good_attempts + good_init + good_max + "'backoffMultiplier': 0.5, " + good_codes + "}");
+  rejects_one(a, "retry codes missing", rp + good_attempts + good_init + good_max + "'backoffMultiplier': 2}");
+  rejects_one(a, "retry codes empty", rp + good_attempts + good_init + good_max + good_mult + "'retryableStatusCodes': []}");
+  rejects_one(a, "retry codes not array", rp + good_attempts + good_init + good_max + good_mult + "'retryableStatusCodes': 'UNAVAILABLE'}");
+  rejects_one(a, "retry codes unknown name", rp + good_attempts + good_init + good_max + good_mult + "'retryableStatusCodes': ['BOGUS']}");
+  rejects_one(a, "retry codes 17", rp + good_attempts + good_init + good_max + good_mult + "'retryableStatusCodes': [17]}");
+  rejects_one(a, "retry codes negative", rp + good_attempts + good_init + good_max + good_mult + "'retryableStatusCodes': [-1]}");
+  rejects_one(a, "retry codes fraction", rp + good_attempts + good_init + good_max + good_mult + "'retryableStatusCodes': [1.5]}");
+  rejects_one(a, "retry codes bool", rp + good_attempts + good_init + good_max + good_mult + "'retryableStatusCodes': [true]}");
+  rejects_one(a, "retry codes digit string", rp + good_attempts + good_init + good_max + good_mult + "'retryableStatusCodes': ['14']}");
+  accepts_one(a, "retry codes 16", rp + good_attempts + good_init + good_max + good_mult + "'retryableStatusCodes': [16, 'UNAUTHENTICATED']}");
+  rejects_one(a, "retry not object", "'retryPolicy': 3");
+  var c5: GrpcServiceConfig;
+  t_str("attempts cap", parse(a, "{{'methodConfig': [{{'name': [{{'service': 'a'}], 'retryPolicy': {{'maxAttempts': 100, 'initialBackoff': '0.000000001s', 'maxBackoff': '0.000000002s', 'backoffMultiplier': 1.0000001, 'retryableStatusCodes': ['cancelled', 'Data_Loss']}}]}", &c5), "");
+  t_eq("attempts capped at 5", c5.methods[0].retry.max_attempts, 5);
+  t_eq("tiny initial backoff", c5.methods[0].retry.initial_backoff_ns, 1);
+  t_eq("tiny max backoff", c5.methods[0].retry.max_backoff_ns, 2);
+  t_eq("mixed case codes", (int64)c5.methods[0].retry.codes, (int64)mask(GRPC_CANCELLED, GRPC_DATA_LOSS, -1));
+
+  // ---- hedging policy ----
+  accepts_one(a, "hedging ok", "'hedgingPolicy': {{'maxAttempts': 2}");
+  accepts_one(a, "hedging full", "'hedgingPolicy': {{'maxAttempts': 3, 'hedgingDelay': '0.5s', 'nonFatalStatusCodes': []}");
+  rejects_one(a, "hedging attempts 1", "'hedgingPolicy': {{'maxAttempts': 1}");
+  rejects_one(a, "hedging attempts missing", "'hedgingPolicy': {{'hedgingDelay': '1s'}");
+  rejects_one(a, "hedging delay bad", "'hedgingPolicy': {{'maxAttempts': 2, 'hedgingDelay': 'x'}");
+  rejects_one(a, "hedging delay negative", "'hedgingPolicy': {{'maxAttempts': 2, 'hedgingDelay': '-1s'}");
+  rejects_one(a, "hedging delay number", "'hedgingPolicy': {{'maxAttempts': 2, 'hedgingDelay': 1}");
+  rejects_one(a, "hedging codes bad", "'hedgingPolicy': {{'maxAttempts': 2, 'nonFatalStatusCodes': ['NOPE']}");
+  rejects_one(a, "hedging codes not array", "'hedgingPolicy': {{'maxAttempts': 2, 'nonFatalStatusCodes': 14}");
+  rejects_one(a, "hedging not object", "'hedgingPolicy': []");
+  rejects_one(a, "retry and hedging", retry_ok + ", 'hedgingPolicy': {{'maxAttempts': 2}");
+  rejects_one(a, "hedging and retry", "'hedgingPolicy': {{'maxAttempts': 2}, " + retry_ok);
+  var c6: GrpcServiceConfig;
+  t_str("hedging defaults", parse(a, "{{'methodConfig': [{{'name': [{{'service': 'a'}], 'hedgingPolicy': {{'maxAttempts': 2}}]}", &c6), "");
+  t_eq("hedging default delay", c6.methods[0].hedging.delay_ns, 0);
+  t_eq("hedging default codes", (int64)c6.methods[0].hedging.non_fatal, 0);
+  t_eq("hedging attempts", c6.methods[0].hedging.max_attempts, 2);
+
+  // An error names where it is.
+  var ce: GrpcServiceConfig;
+  var emsg: string = parse(a, "{{'methodConfig': [{{'name': [{{'service': 'a'}]}, {{'name': [{{'service': 'a'}]}]}", &ce);
+  t_str("error names config", emsg, "methodConfig[1]: name appears more than once");
+
+  // ---- durations ----
+  t_eq("dur 1s", grpc_duration_parse("1s"), 1000000000);
+  t_eq("dur 0s", grpc_duration_parse("0s"), 0);
+  t_eq("dur 0.5s", grpc_duration_parse("0.5s"), 500000000);
+  t_eq("dur 1.000000001s", grpc_duration_parse("1.000000001s"), 1000000001);
+  t_eq("dur 0.000000001s", grpc_duration_parse("0.000000001s"), 1);
+  t_eq("dur 0.1s", grpc_duration_parse("0.1s"), 100000000);
+  t_eq("dur 1.5s", grpc_duration_parse("1.5s"), 1500000000);
+  t_eq("dur 00001s", grpc_duration_parse("00001s"), 1000000000);
+  t_eq("dur 3600s", grpc_duration_parse("3600s"), 3600000000000);
+  t_eq("dur 0.0s", grpc_duration_parse("0.0s"), 0);
+  t_eq("dur 9223372036s", grpc_duration_parse("9223372036s"), 9223372036000000000);
+  t_eq("dur max exact", grpc_duration_parse("9223372036.854775807s"), 9223372036854775807);
+  t_eq("dur saturates", grpc_duration_parse("9223372037s"), 9223372036854775807);
+  t_eq("dur proto max", grpc_duration_parse("315576000000s"), 9223372036854775807);
+  t_eq("dur over proto max", grpc_duration_parse("315576000001s"), -1);
+  t_eq("dur negative", grpc_duration_parse("-1s"), -1);
+  t_eq("dur negative zero", grpc_duration_parse("-0s"), -1);
+  t_eq("dur plus", grpc_duration_parse("+1s"), -1);
+  t_eq("dur no unit", grpc_duration_parse("1"), -1);
+  t_eq("dur only s", grpc_duration_parse("s"), -1);
+  t_eq("dur empty", grpc_duration_parse(""), -1);
+  t_eq("dur empty fraction", grpc_duration_parse("1.s"), -1);
+  t_eq("dur no integer", grpc_duration_parse(".5s"), -1);
+  t_eq("dur 10 fraction digits", grpc_duration_parse("1.0000000001s"), -1);
+  t_eq("dur 9 fraction digits ok", grpc_duration_parse("1.000000000s"), 1000000000);
+  t_eq("dur space", grpc_duration_parse("1 s"), -1);
+  t_eq("dur trailing space", grpc_duration_parse("1s "), -1);
+  t_eq("dur leading space", grpc_duration_parse(" 1s"), -1);
+  t_eq("dur upper S", grpc_duration_parse("1S"), -1);
+  t_eq("dur ms", grpc_duration_parse("1ms"), -1);
+  t_eq("dur two dots", grpc_duration_parse("1.5.5s"), -1);
+  t_eq("dur exponent", grpc_duration_parse("1e3s"), -1);
+  t_eq("dur letters", grpc_duration_parse("abcs"), -1);
+  t_eq("dur huge digits", grpc_duration_parse("99999999999999999999999999s"), -1);
+
+  // ---- retry backoff ----
+  var p: GrpcRetryPolicy;
+  p.max_attempts = 5;
+  p.initial_backoff_ns = 100000000;
+  p.max_backoff_ns = 1000000000;
+  p.multiplier = 2.0;
+  p.codes = 1;
+  t_eq("backoff 1 half", grpc_retry_backoff_ns(&p, 1, 0.5), 50000000);
+  t_eq("backoff 2 half", grpc_retry_backoff_ns(&p, 2, 0.5), 100000000);
+  t_eq("backoff 3 half", grpc_retry_backoff_ns(&p, 3, 0.5), 200000000);
+  t_eq("backoff 4 half", grpc_retry_backoff_ns(&p, 4, 0.5), 400000000);
+  t_eq("backoff 5 half (capped)", grpc_retry_backoff_ns(&p, 5, 0.5), 500000000);
+  t_eq("backoff 100 half (capped)", grpc_retry_backoff_ns(&p, 100, 0.5), 500000000);
+  t_eq("backoff 1000000 half (capped)", grpc_retry_backoff_ns(&p, 1000000, 0.5), 500000000);
+  t_eq("backoff zero rnd", grpc_retry_backoff_ns(&p, 3, 0.0), 0);
+  near("backoff 1 high rnd", grpc_retry_backoff_ns(&p, 1, 0.999), 99900000);
+  near("backoff 4 high rnd", grpc_retry_backoff_ns(&p, 4, 0.999), 799200000);
+  near("backoff 5 high rnd (cap)", grpc_retry_backoff_ns(&p, 5, 0.999), 999000000);
+  near("backoff 50 high rnd (cap)", grpc_retry_backoff_ns(&p, 50, 0.999), 999000000);
+  t_eq("backoff retry 0 is first", grpc_retry_backoff_ns(&p, 0, 0.5), 50000000);
+  t_eq("backoff negative n is first", grpc_retry_backoff_ns(&p, -3, 0.5), 50000000);
+  t_ok("backoff below max", grpc_retry_backoff_ns(&p, 100, 0.999999) < p.max_backoff_ns);
+  p.multiplier = 10.0;
+  t_eq("backoff huge factor", grpc_retry_backoff_ns(&p, 100000, 0.5), 500000000);
+  p.multiplier = 1.0;
+  t_eq("backoff multiplier 1", grpc_retry_backoff_ns(&p, 50, 0.5), 50000000);
+  p.multiplier = 0.5;
+  t_eq("backoff multiplier below 1", grpc_retry_backoff_ns(&p, 3, 0.5), 12500000);
+  t_eq("backoff far shrink", grpc_retry_backoff_ns(&p, 100000, 0.5), 0);
+  p.multiplier = 1.5;
+  p.initial_backoff_ns = 1000000000;
+  p.max_backoff_ns = 9223372036854775807;
+  near("backoff max cap with huge max", grpc_retry_backoff_ns(&p, 2, 0.5), 750000000);
+  t_ok("backoff huge max stays positive", grpc_retry_backoff_ns(&p, 100000, 0.9999999) > 0);
+  p.initial_backoff_ns = 0;
+  t_eq("backoff zero initial", grpc_retry_backoff_ns(&p, 3, 0.5), 0);
+
+  // ---- throttle ----
+  var t: GrpcRetryThrottle;
+  grpc_throttle_init(&t, 10.0, 0.1);
+  t_ok("throttle starts full", t.tokens == 10.0 && grpc_throttle_allows(&t));
+  for i in 0..4 { grpc_throttle_failure(&t); }
+  t_ok("after 4 failures: 6 tokens", t.tokens == 6.0);
+  t_ok("after 4 failures: allowed", grpc_throttle_allows(&t));
+  grpc_throttle_failure(&t);
+  t_ok("after 5 failures: 5 tokens", t.tokens == 5.0);
+  t_ok("after 5 failures: half is not enough", !grpc_throttle_allows(&t));
+  grpc_throttle_failure(&t);
+  t_ok("after 6 failures: refused", !grpc_throttle_allows(&t));
+  grpc_throttle_success(&t);
+  t_ok("one success from 4: still refused", !grpc_throttle_allows(&t));
+  for i in 0..9 { grpc_throttle_success(&t); }
+  grpc_throttle_success(&t);
+  grpc_throttle_success(&t);
+  t_ok("twelve successes: allowed again", grpc_throttle_allows(&t));
+  t_ok("tokens about 5.2", t.tokens > 5.19 && t.tokens < 5.21);
+  grpc_throttle_init(&t, 10.0, 0.1);
+  for i in 0..20 { grpc_throttle_failure(&t); }
+  t_ok("tokens floor at 0", t.tokens == 0.0);
+  t_ok("empty refuses", !grpc_throttle_allows(&t));
+  grpc_throttle_init(&t, 10.0, 0.1);
+  for i in 0..5 { grpc_throttle_success(&t); }
+  t_ok("tokens cap at max", t.tokens == 10.0);
+  grpc_throttle_failure(&t);
+  grpc_throttle_failure(&t);
+  grpc_throttle_failure(&t);
+  grpc_throttle_failure(&t);
+  grpc_throttle_failure(&t);
+  grpc_throttle_success(&t);
+  t_ok("5 failures then a success: allowed", grpc_throttle_allows(&t));
+  // From a parsed config.
+  var tc: GrpcRetryThrottle;
+  grpc_throttle_init(&tc, c.max_tokens, c.token_ratio);
+  t_ok("from config", tc.tokens == 10.0 && tc.ratio == 0.1);
+
+  // ---- pushback ----
+  t_eq("pushback 0", grpc_pushback_parse("0"), 0);
+  t_eq("pushback 1", grpc_pushback_parse("1"), 1000000);
+  t_eq("pushback 250", grpc_pushback_parse("250"), 250000000);
+  t_eq("pushback leading zeros", grpc_pushback_parse("007"), 7000000);
+  t_eq("pushback large ok", grpc_pushback_parse("9223372036854"), 9223372036854000000);
+  t_eq("pushback saturates", grpc_pushback_parse("9223372036855"), 9223372036854775807);
+  t_eq("pushback max int saturates", grpc_pushback_parse("9223372036854775807"), 9223372036854775807);
+  t_eq("pushback overflow saturates", grpc_pushback_parse("99999999999999999999999"), 9223372036854775807);
+  t_eq("pushback negative", grpc_pushback_parse("-1"), -1);
+  t_eq("pushback negative zero", grpc_pushback_parse("-0"), -1);
+  t_eq("pushback empty", grpc_pushback_parse(""), -1);
+  t_eq("pushback junk", grpc_pushback_parse("abc"), -1);
+  t_eq("pushback trailing junk", grpc_pushback_parse("12abc"), -1);
+  t_eq("pushback leading space", grpc_pushback_parse(" 5"), -1);
+  t_eq("pushback trailing space", grpc_pushback_parse("5 "), -1);
+  t_eq("pushback plus", grpc_pushback_parse("+5"), -1);
+  t_eq("pushback fraction", grpc_pushback_parse("1.5"), -1);
+  t_eq("pushback exponent", grpc_pushback_parse("1e3"), -1);
+  t_eq("pushback hex", grpc_pushback_parse("0x10"), -1);
+
+  arena_free(a);
+  return t_done("svcconfig");
+}

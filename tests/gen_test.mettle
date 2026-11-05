@@ -1,0 +1,24 @@
+// The generated protobuf code compiles and round-trips.
+import "grpc/gen/google/rpc/status_pb";
+import "grpc/gen/google/rpc/error_details_pb";
+import "grpc/gen/grpc/health/v1/health_pb";
+import "grpc/gen/grpc/reflection/v1/reflection_pb";
+import "grpc/gen/google/protobuf/descriptor_pb";
+import "codec/core/rev";
+import "codec/core/status";
+import "tutil";
+
+fn main() -> int32 {
+  var s: GrpcPbStatus;
+  GrpcPbStatus_init(&s);
+  s.code = 5;
+  s.message = "missing";
+  var w: CodecRev;
+  var bytes: string = GrpcPbStatus_serialize(&s, &w);
+  var back: GrpcPbStatus;
+  GrpcPbStatus_init(&back);
+  t_eq("decode", GrpcPbStatus_decode(&back, bytes), CODEC_OK);
+  t_eq("code", back.code, 5);
+  t_str("message", back.message, "missing");
+  return t_done("gen");
+}

@@ -1,0 +1,419 @@
+// The JSON parser: every value kind, escapes, numbers, errors, depth, fuzzing.
+import "grpc/json";
+import "tutil";
+import "std/arena";
+
+// A string of the first n of these bytes.
+fn bs(a: Arena*, n: int64, b0: int32, b1: int32, b2: int32, b3: int32) -> string {
+  var p: uint8* = (uint8*)arena_alloc(a, 5);
+  p[0] = (uint8)b0;
+  p[1] = (uint8)b1;
+  p[2] = (uint8)b2;
+  p[3] = (uint8)b3;
+  var r: string;
+  r.chars = p;
+  r.length = (uint64)n;
+  return r;
+}
+
+fn pok(a: Arena*, s: string) -> GrpcJson* {
+  var out: GrpcJson* = (GrpcJson*)0;
+  var e: string = grpc_json_parse(a, s, &out);
+  if (e != "") {
+    println("unexpected error for '{s}': {e}");
+    return (GrpcJson*)0;
+  }
+  return out;
+}
+
+fn perr(a: Arena*, s: string) -> string {
+  var out: GrpcJson* = (GrpcJson*)0;
+  var e: string = grpc_json_parse(a, s, &out);
+  if (e != "" && out != 0) { return "out set on error"; }
+  if (e == "" && out == 0) { return "no tree"; }
+  if (e == "") { return "ok"; }
+  return e;
+}
+
+// The parsed number of a document, or -999 if it did not parse as one.
+fn num(a: Arena*, s: string) -> float64 {
+  var j: GrpcJson* = pok(a, s);
+  if (j == 0 || j->kind != GRPC_JSON_NUMBER) { return -999.0; }
+  return j->num;
+}
+
+fn str_of(a: Arena*, s: string) -> string {
+  var j: GrpcJson* = pok(a, s);
+  if (j == 0 || j->kind != GRPC_JSON_STRING) { return "NOT A STRING"; }
+  return j->str;
+}
+
+fn zeros(a: Arena*, n: int64) -> string {
+  var p: uint8* = (uint8*)arena_alloc(a, n + 1);
+  for i in 0..n { p[i] = 48; }
+  var r: string;
+  r.chars = p;
+  r.length = (uint64)n;
+  return r;
+}
+
+// n nested arrays (or objects) around a 1.
+fn nest(a: Arena*, n: int64, obj: bool) -> string {
+  var open: string = "[";
+  var close: string = "]";
+  if (obj) {
+    open = "{{\"a\":";
+    close = "}";
+  }
+  var size: int64 = n * (int64)(open.length + close.length) + 1;
+  var buf: uint8* = (uint8*)arena_alloc(a, size);
+  var o: int64 = 0;
+  for i in 0..n {
+    for k in 0..(int64)open.length {
+      buf[o] = open.chars[k];
+      o = o + 1;
+    }
+  }
+  buf[o] = 49;
+  o = o + 1;
+  for i in 0..n {
+    for k in 0..(int64)close.length {
+      buf[o] = close.chars[k];
+      o = o + 1;
+    }
+  }
+  var r: string;
+  r.chars = buf;
+  r.length = (uint64)o;
+  return r;
+}
+
+fn close_to(got: float64, want: float64) -> bool {
+  var d: float64 = got - want;
+  if (d < 0.0) { d = -d; }
+  var m: float64 = want;
+  if (m < 0.0) { m = -m; }
+  return d <= m * 1e-14;
+}
+
+// The input must either parse or fail; it must never crash.
+fn survive(a: Arena*, s: string) -> int32 {
+  var out: GrpcJson* = (GrpcJson*)0;
+  var e: string = grpc_json_parse(a, s, &out);
+  if (e == "") {
+    if (out == 0) { return -1; }
+    return 1;
+  }
+  return 0;
+}
+
+fn main() -> int32 {
+  var a: Arena* = arena_init(0);
+
+  // ---- every kind ----
+  var j: GrpcJson* = pok(a, "null");
+  t_ok("null", j != 0 && j->kind == GRPC_JSON_NULL);
+  j = pok(a, " true ");
+  t_ok("true", j != 0 && j->kind == GRPC_JSON_BOOL && j->b);
+  j = pok(a, "false");
+  t_ok("false", j != 0 && j->kind == GRPC_JSON_BOOL && !j->b);
+  j = pok(a, "\t\r\n 7 \n");
+  t_ok("ws number", j != 0 && j->kind == GRPC_JSON_NUMBER && j->num == 7.0);
+  j = pok(a, "\"hi\"");
+  t_ok("string", j != 0 && j->kind == GRPC_JSON_STRING && j->str == "hi");
+  j = pok(a, "\"\"");
+  t_ok("empty string", j != 0 && j->kind == GRPC_JSON_STRING && j->str.length == 0);
+  j = pok(a, "[]");
+  t_ok("empty array", j != 0 && j->kind == GRPC_JSON_ARRAY && j->count == 0);
+  j = pok(a, "{{}");
+  t_ok("empty object", j != 0 && j->kind == GRPC_JSON_OBJECT && j->count == 0);
+  j = pok(a, " [ ] ");
+  t_ok("empty array ws", j != 0 && j->count == 0);
+  j = pok(a, " {{ } ");
+  t_ok("empty object ws", j != 0 && j->count == 0);
+
+  j = pok(a, "[1, \"two\", [3], {{\"four\": 4}, null, true]");
+  t_ok("array parsed", j != 0 && j->kind == GRPC_JSON_ARRAY && j->count == 6);
+  if (j != 0 && j->count == 6) {
+    t_ok("a0", j->items[0].kind == GRPC_JSON_NUMBER && j->items[0].num == 1.0);
+    t_ok("a1", j->items[1].kind == GRPC_JSON_STRING && j->items[1].str == "two");
+    t_ok("a2", j->items[2].kind == GRPC_JSON_ARRAY && j->items[2].count == 1);
+    t_ok("a3", j->items[3].kind == GRPC_JSON_OBJECT && grpc_json_get(&j->items[3], "four") != 0);
+    t_ok("a4", j->items[4].kind == GRPC_JSON_NULL);
+    t_ok("a5", j->items[5].kind == GRPC_JSON_BOOL && j->items[5].b);
+  }
+
+  // A long array forces the buffer to grow several times.
+  var big: uint8* = (uint8*)arena_alloc(a, 2000);
+  var bo: int64 = 0;
+  big[bo] = 91;
+  bo = bo + 1;
+  for i in 0..300 {
+    if (i > 0) {
+      big[bo] = 44;
+      bo = bo + 1;
+    }
+    big[bo] = (uint8)(48 + i % 10);
+    bo = bo + 1;
+  }
+  big[bo] = 93;
+  bo = bo + 1;
+  var bigs: string;
+  bigs.chars = big;
+  bigs.length = (uint64)bo;
+  j = pok(a, bigs);
+  t_ok("big array", j != 0 && j->count == 300);
+  if (j != 0 && j->count == 300) {
+    t_ok("big array first", j->items[0].num == 0.0);
+    t_ok("big array last", j->items[299].num == 9.0);
+    t_ok("big array mid", j->items[123].num == 3.0);
+  }
+
+  // ---- objects and lookup ----
+  j = pok(a, "{{\"a\": 1, \"b\": {{\"c\": [true]}, \"a\": 2, \"\": 3}");
+  t_ok("object parsed", j != 0 && j->kind == GRPC_JSON_OBJECT && j->count == 4);
+  var ga: GrpcJson* = grpc_json_get(j, "a");
+  t_ok("get first match", ga != 0 && ga->num == 1.0);
+  var gb: GrpcJson* = grpc_json_get(j, "b");
+  t_ok("get nested", gb != 0 && gb->kind == GRPC_JSON_OBJECT);
+  var gc: GrpcJson* = grpc_json_get(gb, "c");
+  t_ok("get array", gc != 0 && gc->kind == GRPC_JSON_ARRAY && gc->count == 1);
+  t_ok("get empty key", grpc_json_get(j, "") != 0 && grpc_json_get(j, "")->num == 3.0);
+  t_ok("get missing", grpc_json_get(j, "zz") == 0);
+  t_ok("get is case sensitive", grpc_json_get(j, "A") == 0);
+  t_ok("get null object", grpc_json_get((GrpcJson*)0, "a") == 0);
+  t_ok("get on array", grpc_json_get(gc, "a") == 0);
+  t_ok("get on string", grpc_json_get(pok(a, "\"a\""), "a") == 0);
+
+  // ---- strings ----
+  t_str("esc quote", str_of(a, "\"a\\\"b\""), "a\"b");
+  t_str("esc backslash", str_of(a, "\"a\\\\b\""), "a\\b");
+  t_str("esc slash", str_of(a, "\"a\\/b\""), "a/b");
+  var ctl: string = str_of(a, "\"\\b\\f\\n\\r\\t\"");
+  t_eq("esc b f n r t length", (int64)ctl.length, 5);
+  if (ctl.length == 5) {
+    t_eq("esc b", (int64)ctl.chars[0], 8);
+    t_eq("esc f", (int64)ctl.chars[1], 12);
+    t_eq("esc n", (int64)ctl.chars[2], 10);
+    t_eq("esc r", (int64)ctl.chars[3], 13);
+    t_eq("esc t", (int64)ctl.chars[4], 9);
+  }
+  t_str("esc mixed", str_of(a, "\"x\\ny\\tz\""), "x\ny\tz");
+  t_str("esc u ascii", str_of(a, "\"\\u0041\\u007a\""), "Az");
+  t_str("esc u 2 bytes", str_of(a, "\"\\u00e9\""), bs(a, 2, 0xc3, 0xa9, 0, 0));
+  t_str("esc u 3 bytes", str_of(a, "\"\\u20AC\""), bs(a, 3, 0xe2, 0x82, 0xac, 0));
+  t_str("esc u upper hex", str_of(a, "\"\\u00E9\""), bs(a, 2, 0xc3, 0xa9, 0, 0));
+  t_str("raw utf8 kept", str_of(a, "\"" + bs(a, 2, 0xc3, 0xa9, 0, 0) + "\""), bs(a, 2, 0xc3, 0xa9, 0, 0));
+  t_str("plain", str_of(a, "\"hello world\""), "hello world");
+  var z: string = str_of(a, "\"\\u0000\"");
+  t_eq("esc u0000 length", (int64)z.length, 1);
+  t_eq("esc u0000 byte", (int64)z.chars[0], 0);
+  var pair: string = str_of(a, "\"\\uD83D\\uDE00\"");
+  t_eq("pair length", (int64)pair.length, 4);
+  if (pair.length == 4) {
+    t_eq("pair b0", (int64)pair.chars[0], 0xF0);
+    t_eq("pair b1", (int64)pair.chars[1], 0x9F);
+    t_eq("pair b2", (int64)pair.chars[2], 0x98);
+    t_eq("pair b3", (int64)pair.chars[3], 0x80);
+  }
+  var pair2: string = str_of(a, "\"a\\ud800\\udc00b\"");
+  t_eq("pair min length", (int64)pair2.length, 6);
+  if (pair2.length == 6) {
+    t_eq("pair min b1", (int64)pair2.chars[1], 0xF0);
+    t_eq("pair min b2", (int64)pair2.chars[2], 0x90);
+  }
+  var pair3: string = str_of(a, "\"\\udbff\\udfff\"");
+  t_eq("pair max b3", (int64)pair3.chars[3], 0xBF);
+  t_eq("pair max b1", (int64)pair3.chars[1], 0x8F);
+
+  // ---- numbers ----
+  t_ok("n 0", num(a, "0") == 0.0);
+  t_ok("n -0", num(a, "-0") == 0.0);
+  t_ok("n -0.5", num(a, "-0.5") == -0.5);
+  t_ok("n 1e3", num(a, "1e3") == 1000.0);
+  t_ok("n 1E+3", num(a, "1E+3") == 1000.0);
+  t_ok("n 12345678901", num(a, "12345678901") == 12345678901.0);
+  t_ok("n 2^53", num(a, "9007199254740992") == 9007199254740992.0);
+  t_ok("n 2^53-1", num(a, "9007199254740991") == 9007199254740991.0);
+  t_ok("n 0.1", num(a, "0.1") == 0.1);
+  t_ok("n 0.25", num(a, "0.25") == 0.25);
+  t_ok("n 1.5e2", num(a, "1.5e2") == 150.0);
+  t_ok("n 25e-1", num(a, "25e-1") == 2.5);
+  t_ok("n 0.001", num(a, "0.001") == 0.001);
+  t_ok("n 0.000123", num(a, "0.000123") == 0.000123);
+  t_ok("n -12.75", num(a, "-12.75") == -12.75);
+  t_ok("n 1e22", num(a, "1e22") == 1e22);
+  t_ok("n 100", num(a, "100") == 100.0);
+  t_ok("n 1e-2", num(a, "1e-2") == 0.01);
+  t_ok("n 0e5", num(a, "0e5") == 0.0);
+  t_ok("n 0.0", num(a, "0.0") == 0.0);
+  t_ok("n 30 digits", close_to(num(a, "123456789012345678901234567890"), 1.2345678901234568e29));
+  t_ok("n long fraction", close_to(num(a, "3.14159265358979323846264338327950288"), 3.141592653589793));
+  t_ok("n 1e308", close_to(num(a, "1e308"), 1e308));
+  t_ok("n tiny is 0", num(a, "1e-999") == 0.0);
+  t_ok("n huge exponent digits", num(a, "0e999999999999999999999") == 0.0);
+  t_ok("n in array", pok(a, "[-1,2]")->items[0].num == -1.0);
+
+  // ---- errors ----
+  t_str("err empty", perr(a, ""), "json: unexpected end at byte 0");
+  t_str("err blank", perr(a, "  \n"), "json: unexpected end at byte 3");
+  t_str("err trailing", perr(a, "1 2"), "json: unexpected trailing data at byte 2");
+  t_str("err trailing bracket", perr(a, "[1]]"), "json: unexpected trailing data at byte 3");
+  t_str("err trailing junk", perr(a, "{{} x"), "json: unexpected trailing data at byte 3");
+  t_str("err trailing comma arr", perr(a, "[1,]"), "json: unexpected character at byte 3");
+  t_str("err missing comma", perr(a, "[1 2]"), "json: expected , or ] at byte 3");
+  t_str("err open array", perr(a, "[1,2"), "json: unexpected end at byte 4");
+  t_str("err open array 2", perr(a, "["), "json: unexpected end at byte 1");
+  t_str("err open object", perr(a, "{{"), "json: unexpected end at byte 1");
+  t_str("err open object 2", perr(a, "{{\"a\":1"), "json: unexpected end at byte 6");
+  t_str("err key only", perr(a, "{{\"a\"}"), "json: expected : at byte 4");
+  t_str("err no value", perr(a, "{{\"a\":}"), "json: unexpected character at byte 5");
+  t_str("err number key", perr(a, "{{1:2}"), "json: expected string key at byte 1");
+  t_str("err comma object", perr(a, "{{,}"), "json: expected string key at byte 1");
+  t_str("err trailing comma obj", perr(a, "{{\"a\":1,}"), "json: expected string key at byte 7");
+  t_str("err obj missing comma", perr(a, "{{\"a\":1 \"b\":2}"), "json: expected , or } at byte 7");
+  t_str("err unterminated", perr(a, "\"abc"), "json: unterminated string at byte 4");
+  t_str("err backslash end", perr(a, "\"abc\\"), "json: unterminated string at byte 5");
+  t_str("err escaped quote end", perr(a, "\"abc\\\""), "json: unterminated string at byte 6");
+  t_str("err newline in string", perr(a, "\"a\nb\""), "json: control character in string at byte 2");
+  t_str("err nul in string", perr(a, "\"a\0b\""), "json: control character in string at byte 2");
+  t_str("err tab in string", perr(a, "\"\t\""), "json: control character in string at byte 1");
+  t_str("err bad escape", perr(a, "\"\\x\""), "json: bad escape at byte 1");
+  t_str("err bad escape single", perr(a, "\"\\'\""), "json: bad escape at byte 1");
+  t_str("err short u", perr(a, "\"\\u12\""), "json: bad \\u escape at byte 1");
+  t_str("err bad hex", perr(a, "\"\\uZZZZ\""), "json: bad \\u escape at byte 1");
+  t_str("err lone high", perr(a, "\"\\ud800\""), "json: lone surrogate at byte 1");
+  t_str("err high then text", perr(a, "\"\\ud800x\""), "json: lone surrogate at byte 1");
+  t_str("err high then high", perr(a, "\"\\ud800\\ud800\""), "json: lone surrogate at byte 1");
+  t_str("err high then plain u", perr(a, "\"\\ud800\\u0041\""), "json: lone surrogate at byte 1");
+  t_str("err lone low", perr(a, "\"\\udc00\""), "json: lone surrogate at byte 1");
+  t_str("err low then high", perr(a, "\"\\udc00\\ud800\""), "json: lone surrogate at byte 1");
+  t_str("err leading zero", perr(a, "01"), "json: unexpected trailing data at byte 1");
+  t_str("err leading zero 2", perr(a, "[00]"), "json: expected , or ] at byte 2");
+  t_str("err plus", perr(a, "+1"), "json: unexpected character at byte 0");
+  t_str("err minus alone", perr(a, "-"), "json: bad number at byte 1");
+  t_str("err minus x", perr(a, "-x"), "json: bad number at byte 1");
+  t_str("err dot end", perr(a, "1."), "json: bad number at byte 2");
+  t_str("err dot start", perr(a, ".5"), "json: unexpected character at byte 0");
+  t_str("err exp empty", perr(a, "1e"), "json: bad number at byte 2");
+  t_str("err exp sign only", perr(a, "1e+"), "json: bad number at byte 3");
+  t_str("err hex", perr(a, "0x10"), "json: unexpected trailing data at byte 1");
+  t_str("err inf", perr(a, "Infinity"), "json: unexpected character at byte 0");
+  t_str("err nan", perr(a, "NaN"), "json: unexpected character at byte 0");
+  t_str("err out of range", perr(a, "1e999"), "json: number out of range at byte 0");
+  t_str("err out of range digits", perr(a, "[1" + zeros(a, 400) + "]"), "json: number out of range at byte 1");
+  t_str("err tru", perr(a, "tru"), "json: bad literal at byte 0");
+  t_str("err nul", perr(a, "nul"), "json: bad literal at byte 0");
+  t_str("err True", perr(a, "True"), "json: unexpected character at byte 0");
+  t_str("err trux", perr(a, "trux"), "json: bad literal at byte 0");
+  t_str("err single quote", perr(a, "'a'"), "json: unexpected character at byte 0");
+  t_str("err comment", perr(a, "// x\n1"), "json: unexpected character at byte 0");
+  t_str("err in nested", perr(a, "{{\"a\":[1,{{\"b\":tru}]}"), "json: bad literal at byte 13");
+  t_str("err nbsp", perr(a, bs(a, 3, 0xc2, 0xa0, 49, 0)), "json: unexpected character at byte 0");
+  t_str("err form feed ws", perr(a, bs(a, 2, 12, 49, 0, 0)), "json: unexpected character at byte 0");
+  t_str("err ok", perr(a, "[]"), "ok");
+
+  // ---- depth ----
+  t_ok("depth 64 arrays", pok(a, nest(a, 64, false)) != 0);
+  t_str("depth 65 arrays", perr(a, nest(a, 65, false)), "json: nesting too deep at byte 64");
+  t_ok("depth 64 objects", pok(a, nest(a, 64, true)) != 0);
+  t_str("depth 65 objects", perr(a, nest(a, 65, true)), "json: nesting too deep at byte 320");
+  t_ok("depth 100000 safe", perr(a, nest(a, 100000, false)) != "ok");
+  t_ok("depth walk", pok(a, nest(a, 10, false))->items[0].items[0].count == 1);
+
+  // ---- fuzz: random strings ----
+  t_seed(12345);
+  var alphabet: string = "{{}[],:\"\\ntfu0123456789.-+eE \tabcdefABCDEF/";
+  var buf: uint8[96];
+  var ok_count: int32 = 0;
+  var bad_count: int32 = 0;
+  var neg: int32 = 0;
+  for it in 0..4000 {
+    var len: int64 = (int64)(t_rand() % 90);
+    for i in 0..len {
+      var r: uint64 = t_rand();
+      if (r % 4 == 0) {
+        buf[i] = (uint8)(t_rand() % 256);
+      } else {
+        buf[i] = alphabet.chars[(t_rand() >> 8) % alphabet.length];
+      }
+    }
+    var s: string;
+    s.chars = &buf[0];
+    s.length = (uint64)len;
+    var res: int32 = survive(a, s);
+    if (res == 1) { ok_count = ok_count + 1; }
+    if (res == 0) { bad_count = bad_count + 1; }
+    if (res < 0) { neg = neg + 1; }
+    if (it % 200 == 199) { arena_reset(a); }
+  }
+  t_eq("fuzz random no tree", neg, 0);
+  t_ok("fuzz random mostly rejected", bad_count > 3000);
+
+  // ---- fuzz: mutations of a valid document ----
+  var doc: string = "{{\"methodConfig\": [{{\"name\": [{{\"service\": \"a.B\", \"method\": \"c\"}], \"timeout\": \"1.5s\", \"retryPolicy\": {{\"maxAttempts\": 4, \"backoffMultiplier\": 2.0, \"codes\": [\"UNAVAILABLE\", 14]}}], \"s\": \"\\u00e9\\ud83d\\ude00\\n\", \"x\": [null, true, false, -1.5e-3]}";
+  t_ok("fuzz doc is valid", survive(a, doc) == 1);
+  var mb: uint8[512];
+  var dl: int64 = (int64)doc.length;
+  var mut_ok: int32 = 0;
+  var mut_bad: int32 = 0;
+  for it in 0..4000 {
+    for i in 0..dl { mb[i] = doc.chars[i]; }
+    var n: int64 = dl;
+    var edits: int64 = 1 + (int64)(t_rand() % 4);
+    for k in 0..edits {
+      if (n < 1) { break; }
+      var kind: uint64 = t_rand() % 5;
+      var at: int64 = (int64)(t_rand() % (uint64)n);
+      if (kind == 0) {
+        mb[at] = (uint8)(t_rand() % 256);
+      } else if (kind == 1) {
+        mb[at] = alphabet.chars[(t_rand() >> 8) % alphabet.length];
+      } else if (kind == 2) {
+        // Delete one byte.
+        for i in at..n - 1 { mb[i] = mb[i + 1]; }
+        n = n - 1;
+      } else if (kind == 3) {
+        // Insert one byte.
+        if (n < 500) {
+          var i2: int64 = n;
+          while (i2 > at) {
+            mb[i2] = mb[i2 - 1];
+            i2 = i2 - 1;
+          }
+          mb[at] = alphabet.chars[(t_rand() >> 8) % alphabet.length];
+          n = n + 1;
+        }
+      } else {
+        // Truncate.
+        n = at;
+        if (n == 0) { n = 1; }
+      }
+    }
+    var s: string;
+    s.chars = &mb[0];
+    s.length = (uint64)n;
+    var res: int32 = survive(a, s);
+    if (res == 1) { mut_ok = mut_ok + 1; }
+    if (res == 0) { mut_bad = mut_bad + 1; }
+    if (res < 0) { neg = neg + 1; }
+    if (it % 200 == 199) { arena_reset(a); }
+  }
+  t_eq("fuzz mutate no tree", neg, 0);
+  t_ok("fuzz mutate rejects some", mut_bad > 500);
+  t_ok("fuzz mutate accepts some", mut_ok > 50);
+
+  // Every prefix of the valid document fails (it is one object), and
+  // never reads past the end.
+  var prefix_ok: int32 = 0;
+  for n in 0..dl {
+    var s: string;
+    s.chars = doc.chars;
+    s.length = (uint64)n;
+    if (survive(a, s) == 1) { prefix_ok = prefix_ok + 1; }
+  }
+  t_eq("no proper prefix parses", prefix_ok, 0);
+
+  arena_free(a);
+  return t_done("json");
+}

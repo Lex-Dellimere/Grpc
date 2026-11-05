@@ -2,3 +2,14 @@
 // in every part; import a single module (such as "grpc/status") to keep
 // the build small.
 import "grpc/status";
+import "grpc/metadata";
+import "grpc/deadline";
+import "grpc/message";
+import "grpc/transport";
+import "grpc/wire";
+import "grpc/memtransport";
+import "grpc/json";
+import "grpc/svcconfig";
+import "grpc/call";
+import "grpc/client";
+import "grpc/server";

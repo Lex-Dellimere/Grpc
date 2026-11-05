@@ -1,0 +1,384 @@
+// Client and server end to end over the in-memory transport: the four call
+// kinds, metadata, status details, deadlines, cancellation, compression,
+// limits, interceptors, retries and hedging.
+import "grpc/grpc";
+import "tutil";
+import "std/mem";
+import "std/arena";
+
+var g_fail_count: int32 = 0;
+var g_prev_attempts: int32 = 0;
+var g_hang: GrpcCall* = (GrpcCall*)0;
+var g_cancels: int32 = 0;
+var g_closes: int32 = 0;
+
+fn str_of(b: GrpcBytes*) -> string {
+  var s: string;
+  s.chars = b->data;
+  s.length = (uint64)b->len;
+  return s;
+}
+
+fn starts(s: string, p: string) -> bool {
+  if (s.length < p.length) { return false; }
+  for i in 0..(int64)p.length {
+    if (s.chars[i] != p.chars[i]) { return false; }
+  }
+  return true;
+}
+
+// ---- server handlers ----------------------------------------------------------
+
+fn unary_msg(u: rawptr, c: GrpcCall*, m: GrpcBytes*) {
+  var req: string = str_of(m);
+  var v: string;
+  g_prev_attempts = c->prev_attempts;
+  if (grpc_md_get(grpc_call_headers_md(c), "x-echo", &v)) {
+    grpc_md_add(grpc_call_md(c), "x-echo", v);
+    grpc_md_add(grpc_call_trailer_md(c), "x-trail", v);
+  }
+  if (req == "fail3") {
+    g_fail_count = g_fail_count + 1;
+    if (g_fail_count < 3) {
+      grpc_srv_finish(c, grpc_status(GRPC_UNAVAILABLE, "try again"));
+      return;
+    }
+  }
+  if (req == "pushback") {
+    g_fail_count = g_fail_count + 1;
+    grpc_md_add(grpc_call_trailer_md(c), "x-unused", "1");
+    grpc_srv_finish(c, grpc_status(GRPC_UNAVAILABLE, "no"));
+    return;
+  }
+  if (req == "hang") {
+    g_hang = c;
+    return;
+  }
+  if (req == "details") {
+    var st: GrpcStatus = grpc_status(GRPC_FAILED_PRECONDITION, "bad state: 100% wrong\n");
+    st.details = "\0\traw";
+    grpc_srv_finish(c, st);
+    return;
+  }
+  grpc_srv_send(c, *m);
+}
+
+fn unary_close(u: rawptr, c: GrpcCall*) {
+  if (c == g_hang || c->ending) { return; }
+  grpc_srv_finish(c, grpc_status(GRPC_OK, ""));
+}
+
+fn on_cancel(u: rawptr, c: GrpcCall*) {
+  g_cancels = g_cancels + 1;
+  if (c == g_hang) { g_hang = (GrpcCall*)0; }
+  grpc_srv_finish(c, grpc_status(GRPC_CANCELLED, ""));
+}
+
+fn hedge_msg(u: rawptr, c: GrpcCall*, m: GrpcBytes*) {
+  g_fail_count = g_fail_count + 1;
+  if (g_fail_count == 1) {
+    g_hang = c;   // the first attempt never answers
+    return;
+  }
+  grpc_srv_send(c, *m);
+}
+
+fn sstream_msg(u: rawptr, c: GrpcCall*, m: GrpcBytes*) {
+  var n: int32 = 0;
+  for i in 0..m->len { n = n * 10 + (int32)(m->data[i] - 48); }
+  for i in 0..n {
+    var b: uint8[1];
+    b[0] = (uint8)(65 + i % 26);
+    var one: GrpcBytes;
+    one.data = &b[0];
+    one.len = 1;
+    grpc_srv_send(c, one);
+  }
+}
+
+fn cstream_msg(u: rawptr, c: GrpcCall*, m: GrpcBytes*) {
+  c->user = (rawptr)((int64)c->user + m->len);
+}
+
+fn cstream_close(u: rawptr, c: GrpcCall*) {
+  var total: int64 = (int64)c->user;
+  var buf: uint8[8];
+  for i in 0..8 { buf[i] = (uint8)((total >> (int64)(i * 8)) & 255); }
+  var b: GrpcBytes;
+  b.data = &buf[0];
+  b.len = 8;
+  grpc_srv_send(c, b);
+  grpc_srv_finish(c, grpc_status(GRPC_OK, ""));
+}
+
+fn bidi_msg(u: rawptr, c: GrpcCall*, m: GrpcBytes*) {
+  grpc_srv_send(c, *m);
+}
+
+// ---- interceptors -------------------------------------------------------------
+
+fn client_auth(u: rawptr, c: GrpcCall*, st: GrpcStatus*) -> bool {
+  grpc_md_add(grpc_call_md(c), "authorization", "Bearer secret");
+  return true;
+}
+
+fn client_close(u: rawptr, c: GrpcCall*, st: GrpcStatus*) {
+  g_closes = g_closes + 1;
+}
+
+fn server_auth(u: rawptr, c: GrpcCall*, st: GrpcStatus*) -> bool {
+  var v: string;
+  if (grpc_md_get(grpc_call_headers_md(c), "authorization", &v) && v == "Bearer secret") { return true; }
+  st->code = GRPC_UNAUTHENTICATED;
+  st->message = "no token";
+  return false;
+}
+
+fn idle_server(u: rawptr) {
+  grpc_server_conn_poll((GrpcServerConn*)u);
+}
+
+fn add(s: GrpcServer*, path: string, kind: int32, on_msg: fn(rawptr, GrpcCall*, GrpcBytes*) -> void, on_close: fn(rawptr, GrpcCall*) -> void) {
+  var d: GrpcMethodDesc;
+  d.path = path;
+  d.kind = kind;
+  d.on_message = on_msg;
+  d.on_half_close = on_close;
+  d.on_cancel = &on_cancel;
+  grpc_server_add(s, &d);
+}
+
+fn finish_ok(c: GrpcCall*) { grpc_srv_finish(c, grpc_status(GRPC_OK, "")); }
+
+fn main() -> int32 {
+  var a: Arena* = arena_init(0);
+  var sc_json: string = "{{\"methodConfig\": [" +
+    "{{\"name\": [{{\"service\": \"test.Echo\", \"method\": \"Unary\"}], \"retryPolicy\": {{\"maxAttempts\": 4, \"initialBackoff\": \"0.001s\", \"maxBackoff\": \"0.005s\", \"backoffMultiplier\": 2, \"retryableStatusCodes\": [\"UNAVAILABLE\"]}}," +
+    "{{\"name\": [{{\"service\": \"test.Echo\", \"method\": \"Hedge\"}], \"hedgingPolicy\": {{\"maxAttempts\": 3, \"hedgingDelay\": \"0.002s\"}}" +
+    "]}";
+  var cfg: GrpcServiceConfig;
+  var err: string = grpc_svc_config_parse(a, sc_json, &cfg);
+  t_str("config parses", err, "");
+
+  var sic: GrpcInterceptor;
+  sic.on_start = &server_auth;
+  var sopts: GrpcServerOptions;
+  sopts.max_recv = 200000;
+  sopts.send_enc = GRPC_ENC_GZIP;
+  sopts.interceptors = &sic;
+  sopts.ninterceptors = 1;
+  var srv: GrpcServer;
+  grpc_server_init(&srv, &sopts);
+  add(&srv, "/test.Echo/Unary", GRPC_UNARY, &unary_msg, &unary_close);
+  add(&srv, "/test.Echo/Plain", GRPC_UNARY, &unary_msg, &unary_close);
+  add(&srv, "/test.Echo/Hedge", GRPC_UNARY, &hedge_msg, &unary_close);
+  add(&srv, "/test.Echo/ServerStream", GRPC_SERVER_STREAMING, &sstream_msg, &unary_close);
+  add(&srv, "/test.Echo/ClientStream", GRPC_CLIENT_STREAMING, &cstream_msg, &cstream_close);
+  add(&srv, "/test.Echo/Bidi", GRPC_BIDI_STREAMING, &bidi_msg, &unary_close);
+
+  var pipe: GrpcMemPipe;
+  grpc_mem_pipe_init(&pipe);
+  var sc: GrpcServerConn;
+  grpc_server_conn_init(&sc, &srv, grpc_mem_transport(&pipe.server));
+  pipe.client.idle = &idle_server;
+  pipe.client.idle_user = (rawptr)&sc;
+
+  var cics: GrpcInterceptor[2];
+  cics[0].on_start = &client_auth;
+  cics[1].on_close = &client_close;
+  var copts: GrpcChannelOptions;
+  copts.service_config = &cfg;
+  copts.interceptors = &cics[0];
+  copts.ninterceptors = 2;
+  copts.send_enc = GRPC_ENC_GZIP;
+  var ch: GrpcChannel;
+  grpc_channel_init(&ch, grpc_mem_transport(&pipe.client), &copts);
+  var o: GrpcCallOptions = grpc_call_options();
+
+  // Unary echo with metadata both ways.
+  var c: GrpcCall* = grpc_call_start(&ch, "/test.Echo/Plain", GRPC_UNARY, &o);
+  grpc_md_add(grpc_call_md(c), "x-echo", "hello");
+  grpc_call_send(c, grpc_bytes("ping"));
+  grpc_call_close_send(c);
+  var m: GrpcBytes;
+  t_ok("unary recv", grpc_call_recv(c, &m) && str_of(&m) == "ping");
+  t_ok("unary no more", !grpc_call_recv(c, &m));
+  var st: GrpcStatus = grpc_call_finish(c);
+  t_eq("unary ok", st.code, GRPC_OK);
+  var v: string;
+  t_ok("header md", grpc_md_get(grpc_call_headers_md(c), "x-echo", &v) && v == "hello");
+  t_ok("trailer md", grpc_md_get(grpc_call_trailers_md(c), "x-trail", &v) && v == "hello");
+  grpc_call_free(c);
+
+  // grpc_unary helper and compression of a big message.
+  var bigs: uint8* = (uint8*)malloc(150000);
+  for i in 0..150000 { bigs[i] = (uint8)(97 + (i / 13) % 7); }
+  var big: GrpcBytes;
+  big.data = bigs;
+  big.len = 150000;
+  var co: GrpcCallOptions = grpc_call_options();
+  co.compress = true;
+  var out: GrpcBytes;
+  st = grpc_unary(&ch, "/test.Echo/Plain", big, &out, &co);
+  t_eq("big ok", st.code, GRPC_OK);
+  t_eq("big len", out.len, 150000);
+  var same: bool = out.len == 150000;
+  if (same) { for i in 0..150000 { if (out.data[i] != bigs[i]) { same = false; break; } } }
+  t_ok("big same", same);
+  if (out.data != 0) { free(out.data); }
+
+  // Server receive limit (200000) on an uncompressed message.
+  var huge: uint8* = (uint8*)malloc(300000);
+  big.data = huge;
+  big.len = 300000;
+  st = grpc_unary(&ch, "/test.Echo/Plain", big, &out, &o);
+  t_eq("too big", st.code, GRPC_RESOURCE_EXHAUSTED);
+  free(huge);
+
+  // Status details and message encoding.
+  st = grpc_unary(&ch, "/test.Echo/Plain", grpc_bytes("details"), &out, &o);
+  t_eq("details code", st.code, GRPC_FAILED_PRECONDITION);
+  t_str("details message", st.message, "bad state: 100% wrong\n");
+  t_ok("details bytes", st.details == "\0\traw");
+
+  // Unknown method.
+  st = grpc_unary(&ch, "/test.Echo/Nope", grpc_bytes("x"), &out, &o);
+  t_eq("unimplemented", st.code, GRPC_UNIMPLEMENTED);
+
+  // Retries: two UNAVAILABLE, then success on the third attempt.
+  g_fail_count = 0;
+  st = grpc_unary(&ch, "/test.Echo/Unary", grpc_bytes("fail3"), &out, &o);
+  t_eq("retry ok", st.code, GRPC_OK);
+  t_eq("retry attempts", g_fail_count, 3);
+  t_eq("previous attempts", g_prev_attempts, 2);
+  if (out.data != 0) { free(out.data); }
+
+  // Retries give up after maxAttempts.
+  g_fail_count = 0;
+  st = grpc_unary(&ch, "/test.Echo/Unary", grpc_bytes("pushback"), &out, &o);
+  t_eq("retry gives up", st.code, GRPC_UNAVAILABLE);
+  t_eq("max attempts", g_fail_count, 4);
+
+  // Hedging: the first attempt hangs, the second answers and wins.
+  g_fail_count = 0;
+  g_cancels = 0;
+  st = grpc_unary(&ch, "/test.Echo/Hedge", grpc_bytes("h"), &out, &o);
+  t_eq("hedge ok", st.code, GRPC_OK);
+  grpc_server_conn_poll(&sc);
+  t_eq("hedge loser cancelled", g_cancels, 1);
+  if (out.data != 0) { free(out.data); }
+
+  // Deadline: the server never answers.
+  var dl: GrpcCallOptions = grpc_call_options();
+  dl.timeout_ns = 30000000;
+  g_cancels = 0;
+  st = grpc_unary(&ch, "/test.Echo/Plain", grpc_bytes("hang"), &out, &dl);
+  t_eq("deadline", st.code, GRPC_DEADLINE_EXCEEDED);
+  grpc_server_conn_poll(&sc);
+  t_eq("server saw cancel", g_cancels, 1);
+
+  // Server streaming.
+  c = grpc_call_start(&ch, "/test.Echo/ServerStream", GRPC_SERVER_STREAMING, &o);
+  grpc_call_send(c, grpc_bytes("30"));
+  grpc_call_close_send(c);
+  var n: int32 = 0;
+  var okseq: bool = true;
+  while (grpc_call_recv(c, &m)) {
+    if (m.len != 1 || m.data[0] != (uint8)(65 + n % 26)) { okseq = false; }
+    n = n + 1;
+  }
+  t_eq("server stream count", n, 30);
+  t_ok("server stream order", okseq);
+  t_eq("server stream ok", grpc_call_finish(c).code, GRPC_OK);
+  grpc_call_free(c);
+
+  // Client streaming.
+  c = grpc_call_start(&ch, "/test.Echo/ClientStream", GRPC_CLIENT_STREAMING, &o);
+  var total: int64 = 0;
+  for i in 1..21 {
+    var piece: uint8* = (uint8*)malloc(i * 100);
+    var pb: GrpcBytes;
+    pb.data = piece;
+    pb.len = i * 100;
+    grpc_call_send(c, pb);
+    total = total + pb.len;
+    free(piece);
+  }
+  grpc_call_close_send(c);
+  t_ok("client stream recv", grpc_call_recv(c, &m) && m.len == 8);
+  var got: int64 = 0;
+  for i in 0..8 { got = got | ((int64)m.data[i] << (int64)(i * 8)); }
+  t_eq("client stream total", got, total);
+  t_eq("client stream ok", grpc_call_finish(c).code, GRPC_OK);
+  grpc_call_free(c);
+
+  // Bidirectional: ping-pong, one message at a time.
+  c = grpc_call_start(&ch, "/test.Echo/Bidi", GRPC_BIDI_STREAMING, &o);
+  var pp: bool = true;
+  for i in 0..50 {
+    var word: string = "msg{i}";
+    grpc_call_send(c, grpc_bytes(word));
+    if (!grpc_call_recv(c, &m) || str_of(&m) != word) { pp = false; }
+  }
+  t_ok("bidi ping-pong", pp);
+  grpc_call_close_send(c);
+  t_ok("bidi end", !grpc_call_recv(c, &m));
+  t_eq("bidi ok", grpc_call_finish(c).code, GRPC_OK);
+  grpc_call_free(c);
+
+  // Client cancel in the middle of a bidi call.
+  g_cancels = 0;
+  c = grpc_call_start(&ch, "/test.Echo/Bidi", GRPC_BIDI_STREAMING, &o);
+  grpc_call_send(c, grpc_bytes("one"));
+  t_ok("cancel first recv", grpc_call_recv(c, &m));
+  grpc_call_cancel(c);
+  t_eq("cancelled", grpc_call_finish(c).code, GRPC_CANCELLED);
+  grpc_call_free(c);
+  grpc_server_conn_poll(&sc);
+  t_eq("server saw client cancel", g_cancels, 1);
+
+  // Two calls open at once on one channel.
+  var c1: GrpcCall* = grpc_call_start(&ch, "/test.Echo/Bidi", GRPC_BIDI_STREAMING, &o);
+  var c2: GrpcCall* = grpc_call_start(&ch, "/test.Echo/Bidi", GRPC_BIDI_STREAMING, &o);
+  grpc_call_send(c1, grpc_bytes("a1"));
+  grpc_call_send(c2, grpc_bytes("b1"));
+  grpc_call_send(c1, grpc_bytes("a2"));
+  t_ok("mux c2", grpc_call_recv(c2, &m) && str_of(&m) == "b1");
+  t_ok("mux c1 a", grpc_call_recv(c1, &m) && str_of(&m) == "a1");
+  t_ok("mux c1 b", grpc_call_recv(c1, &m) && str_of(&m) == "a2");
+  t_eq("mux c1 ok", grpc_call_finish(c1).code, GRPC_OK);
+  t_eq("mux c2 ok", grpc_call_finish(c2).code, GRPC_OK);
+  grpc_call_free(c1);
+  grpc_call_free(c2);
+
+  // A channel without the auth interceptor is turned away by the server's.
+  var pipe2: GrpcMemPipe;
+  grpc_mem_pipe_init(&pipe2);
+  var sc2: GrpcServerConn;
+  grpc_server_conn_init(&sc2, &srv, grpc_mem_transport(&pipe2.server));
+  pipe2.client.idle = &idle_server;
+  pipe2.client.idle_user = (rawptr)&sc2;
+  var copts2: GrpcChannelOptions;
+  var ch2: GrpcChannel;
+  grpc_channel_init(&ch2, grpc_mem_transport(&pipe2.client), &copts2);
+  st = grpc_unary(&ch2, "/test.Echo/Plain", grpc_bytes("x"), &out, &o);
+  t_eq("unauthenticated", st.code, GRPC_UNAUTHENTICATED);
+  t_str("unauth message", st.message, "no token");
+
+  // Graceful shutdown: GOAWAY, then new calls fail fast (no reconnect).
+  grpc_server_conn_shutdown(&sc2);
+  st = grpc_unary(&ch2, "/test.Echo/Plain", grpc_bytes("x"), &out, &o);
+  t_eq("after goaway", st.code, GRPC_UNAVAILABLE);
+  grpc_channel_close(&ch2);
+  grpc_server_conn_free(&sc2);
+  grpc_mem_pipe_free(&pipe2);
+
+  t_ok("client on_close ran", g_closes >= 14);
+  grpc_channel_close(&ch);
+  grpc_server_conn_free(&sc);
+  grpc_mem_pipe_free(&pipe);
+  grpc_server_free(&srv);
+  free(bigs);
+  arena_free(a);
+  return t_done("call");
+}
