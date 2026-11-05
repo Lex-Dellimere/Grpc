@@ -135,6 +135,8 @@ export struct GrpcCall {
   nrecv: int64;
   cancelled: bool;
   prev_attempts: int32;      // attempts the client made before this one
+  compress_pref: int32;      // grpc_srv_compress: -1 not set, 0 off, 1 on
+  recv_compressed: bool;     // the message just delivered came compressed
 }
 
 // A fresh call with its own arena.

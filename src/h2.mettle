@@ -16,6 +16,9 @@ export struct GrpcH2 {
   closed: bool;
   max_stream: int32;      // highest stream the peer opened (server GOAWAY)
   ping_n: uint64;
+  // For a TLS stream: true when it holds decrypted bytes the socket can no
+  // longer signal (grpc/tls sets it).
+  buffered: fn(rawptr) -> bool;
 }
 
 fn h(u: rawptr) -> GrpcH2* { return (GrpcH2*)u; }
@@ -162,6 +165,18 @@ fn t_poll(u: rawptr, ev: GrpcTEvent*, timeout_ns: int64) -> int32 {
     flush(t);
     if (t->closed || h2c_is_dead(t->c)) { return -1; }
     if (waited && ms >= 0) { return 0; }
+    if (t->buffered != 0 && t->buffered(t->ns.ctx)) {
+      // Read what the TLS layer already holds without waiting on the socket.
+      var p: uint8* = (uint8*)0;
+      var space: int64 = h2c_input_space(t->c, &p);
+      if (space > 0) {
+        var got: int64 = net_stream_read(&t->ns, p, space);
+        if (got > 0) {
+          h2c_input_commit(t->c, got);
+          continue;
+        }
+      }
+    }
     var r: int64 = h2c_pump(t->c, &t->ns, ms);
     waited = true;
     if (r == H2C_PUMP_EOF) { continue; }

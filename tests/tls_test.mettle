@@ -1,0 +1,118 @@
+// gRPC over TLS and mutual TLS on loopback (certificates in tests/data/tls).
+import "grpc/grpc";
+import "grpc/tls";
+import "mtls/mtls";
+import "tutil";
+import "std/mem";
+import "std/core";
+import "std/socket";
+import "std/netaddr";
+import "std/thread";
+
+var g_listen: int64 = -1;
+var g_srv: GrpcServer;
+var g_cfg: MtlsConfig;
+var g_accept_rc: int32 = 0;
+
+fn echo_msg(u: rawptr, c: GrpcCall*, m: GrpcBytes*) { grpc_srv_send(c, *m); }
+fn echo_close(u: rawptr, c: GrpcCall*) { grpc_srv_finish(c, grpc_status(GRPC_OK, "")); }
+
+// Serves `count` connections one after another.
+fn server_main(arg: cstring) -> uint32 {
+  var count: int64 = (int64)arg;
+  for i in 0..count {
+    var peer: NetAddr;
+    var fd: int64 = sock_accept(g_listen, &peer);
+    if (fd < 0) { return 1; }
+    var s: MtlsStream;
+    var t: GrpcH2;
+    var rc: int32 = grpc_tls_accept(&t, &s, fd, &g_cfg);
+    g_accept_rc = rc;
+    if (rc != GRPC_TLS_OK) { continue; }
+    var sc: GrpcServerConn;
+    grpc_server_conn_init(&sc, &g_srv, grpc_h2_transport(&t));
+    grpc_server_conn_serve(&sc);
+    grpc_server_conn_free(&sc);
+    grpc_h2_free(&t);
+  }
+  return 0;
+}
+
+fn one_call(port: int32, with_cert: bool) -> int32 {
+  var roots: MtlsRoots;
+  mtls_roots_init(&roots);
+  mtls_roots_add_file(&roots, "tests/data/tls/ca.pem");
+  var cfg: MtlsConfig;
+  mtls_config_init(&cfg);
+  cfg.roots = &roots;
+  if (with_cert) { mtls_config_load_cert_files(&cfg, "tests/data/tls/client.pem", "tests/data/tls/client.key"); }
+  var s: MtlsStream;
+  var t: GrpcH2;
+  var rc: int32 = grpc_tls_dial(&t, &s, "127.0.0.1", port, &cfg, 3000);
+  if (rc != GRPC_TLS_OK) { return -100 + rc; }
+  var copts: GrpcChannelOptions;
+  copts.scheme = "https";
+  var ch: GrpcChannel;
+  grpc_channel_init(&ch, grpc_h2_transport(&t), &copts);
+  var o: GrpcCallOptions = grpc_call_options();
+  o.timeout_ns = 5000000000;
+  var n: int64 = 200000;
+  var big: uint8* = (uint8*)malloc(n);
+  for i in 0..n { big[i] = (uint8)(i & 255); }
+  var b: GrpcBytes;
+  b.data = big;
+  b.len = n;
+  var out: GrpcBytes;
+  var st: GrpcStatus = grpc_unary(&ch, "/t.E/Unary", b, &out, &o);
+  var code: int32 = st.code;
+  if (code == GRPC_OK && (out.len != n || out.data[n - 1] != big[n - 1])) { code = 99; }
+  if (out.data != 0) { free(out.data); }
+  free(big);
+  grpc_channel_close(&ch);
+  grpc_h2_free(&t);
+  return code;
+}
+
+fn main() -> int32 {
+  var sopts: GrpcServerOptions;
+  grpc_server_init(&g_srv, &sopts);
+  var d: GrpcMethodDesc;
+  d.path = "/t.E/Unary";
+  d.kind = GRPC_UNARY;
+  d.on_message = &echo_msg;
+  d.on_half_close = &echo_close;
+  grpc_server_add(&g_srv, &d);
+
+  var roots: MtlsRoots;
+  mtls_roots_init(&roots);
+  t_eq("ca", mtls_roots_add_file(&roots, "tests/data/tls/ca.pem") >= 0, true);
+  mtls_config_init(&g_cfg);
+  t_eq("server cert", mtls_config_load_cert_files(&g_cfg, "tests/data/tls/server.pem", "tests/data/tls/server.key"), MTLS_OK);
+
+  var any: NetAddr = net_addr_loopback(NET_IPV4, 0);
+  match (tcp_listen(&any, 4)) {
+    case Ok(fd): { g_listen = fd; }
+    case Err(e): { return t_done("tls: cannot listen"); }
+  }
+  var sa: NetAddr;
+  sock_local_addr(g_listen, &sa);
+  var tid: uint32 = 0;
+
+  // Plain TLS.
+  var th: int64 = CreateThread((cstring)0, (uint64)0, &server_main, (cstring)1, (uint32)0, &tid);
+  t_eq("tls call", one_call(sa.port, false), GRPC_OK);
+  thread_join_infinite(th);
+
+  // Mutual TLS: a client with a certificate passes, one without is refused.
+  g_cfg.roots = &roots;
+  g_cfg.client_auth = MTLS_CLIENT_AUTH_REQUIRE;
+  th = CreateThread((cstring)0, (uint64)0, &server_main, (cstring)2, (uint32)0, &tid);
+  t_eq("mtls call", one_call(sa.port, true), GRPC_OK);
+  t_ok("mtls without cert refused", one_call(sa.port, false) != GRPC_OK);
+  thread_join_infinite(th);
+  t_eq("server refused it", g_accept_rc, GRPC_TLS_E_CONNECT);
+
+  sock_close(g_listen);
+  grpc_server_free(&g_srv);
+  return t_done("tls");
+}

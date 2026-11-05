@@ -213,7 +213,7 @@ fn send_headers_now(sc: GrpcServerConn*, c: GrpcCall*) {
   c->compress = false;
   if (sc->srv->opts.send_enc != GRPC_ENC_IDENTITY && grpc_accept_has(c->peer_accept, sc->srv->opts.send_enc)) {
     c->send_enc = sc->srv->opts.send_enc;
-    c->compress = true;
+    c->compress = c->compress_pref != 0;
   }
   var a: Arena* = arena_init(4096);
   var hl: GrpcHeaderList;
@@ -285,6 +285,13 @@ export fn grpc_srv_send(c: GrpcCall*, msg: GrpcBytes) -> int32 {
   return GRPC_OK;
 }
 
+// Turns compression of the next responses on or off. It takes effect only
+// when the server has a send_enc the client accepts; the default is on.
+export fn grpc_srv_compress(c: GrpcCall*, on: bool) {
+  if (on) { c->compress_pref = 1; } else { c->compress_pref = 0; }
+  if (c->sent_headers) { c->compress = on && c->send_enc != GRPC_ENC_IDENTITY; }
+}
+
 // Bytes queued but not yet taken by the transport; a handler streaming a
 // lot can wait for this to fall before sending more.
 export fn grpc_srv_pending(c: GrpcCall*) -> int64 {
@@ -342,6 +349,7 @@ fn on_new_stream(sc: GrpcServerConn*, ev: GrpcTEvent*) {
   c->conn = (rawptr)sc;
   c->max_recv = s->opts.max_recv;
   c->max_send = s->opts.max_send;
+  c->compress_pref = -1;
   c->interceptors = s->opts.interceptors;
   c->ninterceptors = s->opts.ninterceptors;
   var info: GrpcRequestInfo;
@@ -450,7 +458,9 @@ fn on_data(sc: GrpcServerConn*, c: GrpcCall*, ev: GrpcTEvent*) {
         return;
       }
       grpc_inbox_put(c, m.data, m.len);
+      c->recv_compressed = m.was_compressed;
     } else {
+      c->recv_compressed = m.was_compressed;
       var b: GrpcBytes;
       b.data = m.data;
       b.len = m.len;

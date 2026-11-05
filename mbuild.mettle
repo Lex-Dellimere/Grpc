@@ -12,11 +12,15 @@ fn project() {
   mb_import_root("src");
   mb_bin("grpc_gen", "tools/grpc_gen/main.mettle");
   mb_bin("example_greeter", "examples/greeter/main.mettle");
+  mb_bin("interop_server", "tools/interop/server.mettle");
+  mb_bin("interop_client", "tools/interop/client.mettle");
 }
 
 fn deps() {
   mb_dep_path("press", "../press");
   mb_dep_path("codec", "../codec");
+  mb_dep_path("mtls", "../mtls");
+  mb_dep_path("crypto", "../cryptex");
 }
 
 // gen: rebuilds the generated code in src/gen and tests/gen: messages with
@@ -32,5 +36,6 @@ fn cmd_gen(a: MbArgs*) -> int32 {
   var gen: string = mb_out("grpc_gen", mb_os(), "debug");
   if (mb_sh(gen + " -I proto --out src/gen --prefix GrpcPb grpc/health/v1/health.proto grpc/reflection/v1/reflection.proto") != 0) { return 1; }
   if (mb_sh(gen + " -I examples/greeter --out examples/greeter/gen helloworld.proto") != 0) { return 1; }
+  if (mb_sh(gen + " -I tools/interop/proto --out tools/interop/gen --prefix Gt grpc/testing/test.proto") != 0) { return 1; }
   return mb_sh(gen + " -I tests/proto -I proto --out tests/gen --prefix T echo.proto");
 }
